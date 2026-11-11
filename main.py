@@ -1,6 +1,10 @@
 """
 Menfess AI Bot: panel inline (aiogram) + userbot (Telethon) dalam satu file.
-Jalankan bot: python main.py
+
+Alur utama:
+  1. Postingan baru di channel terdeteksi otomatis (realtime + cek berkala sebagai cadangan).
+  2. Setiap postingan dibalas di kolom komentar, berapa pun panjang teksnya.
+  3. Kalau gagal membalas, bot mengirim alasannya ke owner (waktu WIB).
 """
 import asyncio
 import html
@@ -14,7 +18,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from itertools import permutations
 
 import aiosqlite
@@ -28,14 +32,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from telethon import TelegramClient, events, utils
-from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
+from telethon import TelegramClient, errors, events, utils
 from telethon.sessions import SQLiteSession, StringSession
-from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
+from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import Channel, PeerChannel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
+esc = html.escape
 
 # ---------- konfigurasi (dari GitHub Secrets) ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -54,9 +59,9 @@ URLS = {
     "groq": "https://api.groq.com/openai/v1/chat/completions",
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
 }
-# Nama model bisa berubah. Kalau ada error HTTP 404, ganti di sini.
+# Nama model bisa berubah. Kalau Tes AI menampilkan 404, ganti di sini atau pilih model lain di panel.
 MODELS = {
-    "gemini": ["gemini-flash-latest", "gemini-2.5-flash-lite"],
+    "gemini": ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
     "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
     "openrouter": ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-3-27b-it:free"],
 }
@@ -82,42 +87,53 @@ STYLES = {
 NUMS = {
     "reply_prob": ("Peluang balas menfess (%)", 0, 100, 5, [25, 50, 75, 100]),
     "thread_prob": ("Peluang balas reply (%)", 0, 100, 5, [30, 60, 80, 100]),
-    "min_len": ("Panjang minimal menfess (karakter)", 0, 200, 1, [0, 1, 3, 10]),
-    "delay_min": ("Jeda minimal (detik)", 0, 600, 5, [5, 15, 30]),
-    "delay_max": ("Jeda maksimal (detik)", 0, 900, 5, [15, 30, 60, 120]),
-    "max_comment_hour": ("Batas komentar per jam", 1, 1000, 10, [6, 30, 100, 1000]),
+    "min_len": ("Panjang minimal menfess (karakter)", 0, 500, 1, [0, 1, 5, 20]),
+    "delay_min": ("Jeda minimal (detik)", 0, 600, 5, [0, 3, 10, 30]),
+    "delay_max": ("Jeda maksimal (detik)", 0, 900, 5, [3, 10, 30, 60]),
+    "max_comment_hour": ("Batas komentar per jam (0 = tanpa batas)", 0, 1000, 10, [0, 30, 100, 500]),
+    "max_age_min": ("Abaikan postingan lebih tua dari (menit)", 5, 1440, 5, [15, 30, 60, 180]),
     "max_thread": ("Balasan per thread", 1, 20, 1, [1, 2, 3, 5]),
     "max_user_day": ("Balasan per user per hari", 1, 100, 1, [3, 5, 10, 20]),
     "dm_hour": ("Balasan DM per jam", 1, 200, 5, [10, 20, 50, 100]),
 }
 HELP = {
-    "reply_prob": "Dari 100 menfess yang masuk, berapa yang dibalas. 100 berarti semua menfess dibalas.",
-    "thread_prob": "Peluang bot membalas orang yang membalas komentarnya. 70 berarti sekitar 7 dari 10.",
-    "min_len": "Menfess yang teksnya lebih pendek dari angka ini dilewati. 0 berarti semua dibalas.",
-    "delay_min": "Waktu tunggu minimal sebelum bot membalas, supaya terlihat manusiawi.",
+    "reply_prob": "Dari 100 menfess yang masuk, berapa yang dibalas. 100 berarti SEMUA dibalas.",
+    "thread_prob": "Peluang bot membalas orang yang membalas komentarnya.",
+    "min_len": "Menfess yang teksnya lebih pendek dari angka ini dilewati. 0 berarti semua dibalas, termasuk foto tanpa teks.",
+    "delay_min": "Waktu tunggu minimal sebelum membalas, supaya terlihat manusiawi.",
     "delay_max": "Waktu tunggu maksimal. Bot memilih acak antara jeda minimal dan maksimal.",
-    "max_comment_hour": "Batas komentar menfess per jam. Setelah tercapai, sisanya dilewati sampai jam berikutnya.",
+    "max_comment_hour": "Batas komentar menfess per jam. 0 berarti tanpa batas.",
+    "max_age_min": "Kalau bot sempat mati, postingan yang lebih tua dari ini tidak dibalas supaya tidak terlihat aneh.",
     "max_thread": "Berapa kali bot boleh membalas dalam satu thread (satu menfess).",
     "max_user_day": "Berapa kali bot boleh membalas satu orang yang sama dalam sehari.",
     "dm_hour": "Batas balasan DM per jam untuk setiap pengguna.",
 }
 DEFAULTS = {
-    "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False, "notify": True,
-    "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 5, "delay_max": 25,
-    "max_comment_hour": 1000, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
+    "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False,
+    "notify": True, "notify_ok": False,
+    "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 0, "delay_max": 3,
+    "max_comment_hour": 0, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
     "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": [],
     "model_gemini": MODELS["gemini"][0],
     "model_groq": MODELS["groq"][0],
     "model_openrouter": MODELS["openrouter"][0],
     "persona": "teman", "style": "x", "prompt": "",
 }
+SETTINGS_VERSION = 6   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
+POLL_SEC = 10          # jeda cek berkala channel (cadangan kalau update realtime tidak masuk)
+SEND_GAP = 2.5         # jeda minimal antar komentar, mencegah FloodWait
 DISCLOSURE = (
     "Halo! 👋 Akun ini menggunakan asisten AI untuk membalas pesan secara otomatis.\n"
     "Ketik /stop kapan saja untuk menghentikan balasan otomatis."
 )
 CLOSING = re.compile(r"^\s*(ok|oke|okay|sip|makasih|mksh|thanks|thx|noted|siap|yoi)[\s!.]*$", re.I)
 MODE_TEXT = {
-    "menfess": "Kamu sedang memberi komentar pada menfess (pesan anonim) di channel. Tanggapi dengan hangat dan relevan.",
+    "menfess": (
+        "Kamu sedang memberi komentar pada sebuah menfess (pesan anonim) di channel. "
+        "Tanggapi isinya dengan relevan. Selalu tulis komentar. "
+        "Jika menfess berisi curhat berat atau keinginan menyakiti diri, balas dengan empati singkat "
+        "dan sarankan bicara dengan orang terpercaya atau profesional."
+    ),
     "reply": "Kamu sedang membalas seseorang di thread komentar sebuah menfess. Lanjutkan percakapan dengan relevan dan singkat.",
     "dm": "Kamu sedang membalas pesan pribadi dari seseorang. Tanggapi sesuai isi pesannya.",
 }
@@ -131,17 +147,45 @@ CREATE TABLE IF NOT EXISTS users (uid INTEGER PRIMARY KEY, lst TEXT, ai_on INTEG
 CREATE TABLE IF NOT EXISTS hist (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, role TEXT, content TEXT);
 CREATE INDEX IF NOT EXISTS hist_key ON hist(key, id);
 CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, level TEXT, text TEXT);
+CREATE TABLE IF NOT EXISTS seen (chat_id INTEGER, post_id INTEGER, PRIMARY KEY(chat_id, post_id));
+CREATE TABLE IF NOT EXISTS cursor (chat_id INTEGER PRIMARY KEY, last_id INTEGER);
 """
+
+WIB = timezone(timedelta(hours=7))
 STARTED = time.time()
 bot = None
 ub = None
 db = None
-LOGIN = {}    # client login OTP yang sedang berjalan
-PENDING = {}  # session string yang menunggu diaktifkan
+LOGIN = {}      # client login OTP yang sedang berjalan
+PENDING = {}    # session string yang menunggu diaktifkan
+LAST = {}       # info postingan terakhir yang terdeteksi
+REPORT_AT = {}  # throttle laporan ke owner
+BG = set()      # referensi task latar belakang
+AI_SEM = asyncio.Semaphore(3)  # maksimal 3 permintaan AI bersamaan
+SEND_LOCK = asyncio.Lock()     # komentar dikirim satu per satu
 
 
 class AIError(Exception):
     pass
+
+
+# ---------- waktu WIB ----------
+
+def now_wib():
+    return datetime.now(WIB)
+
+
+def fmt(ts=None):
+    d = datetime.fromtimestamp(ts, WIB) if ts else now_wib()
+    return d.strftime("%d-%m-%Y %H:%M:%S") + " WIB"
+
+
+def fmt_short(ts):
+    return datetime.fromtimestamp(ts, WIB).strftime("%d/%m %H:%M:%S")
+
+
+def short(e):
+    return (str(e) or type(e).__name__)[:150]
 
 
 # ---------- database ----------
@@ -152,8 +196,19 @@ async def db_init():
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
+    rows = await q("SELECT value FROM settings WHERE key='settings_version'")
+    old = json.loads(rows[0]["value"]) if rows else 0
+    if old != SETTINGS_VERSION:
+        # Versi baru: pengaturan lama dibuang dan default terbaru dipakai.
+        # Hanya session dan prompt kustom yang dipertahankan.
+        await db.execute("DELETE FROM settings WHERE key NOT IN ('session','prompt')")
+        await db.execute(
+            "INSERT OR REPLACE INTO settings VALUES('settings_version', ?)",
+            (json.dumps(SETTINGS_VERSION),),
+        )
     for k, v in DEFAULTS.items():
         await db.execute("INSERT OR IGNORE INTO settings VALUES(?, ?)", (k, json.dumps(v)))
+    await db.execute("DELETE FROM seen WHERE rowid NOT IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT 5000)")
     await db.commit()
 
 
@@ -192,11 +247,6 @@ async def stat(name):
     await incr(f"stat:{name}")
 
 
-async def skip(reason):
-    await stat("skipped")
-    await log_("INFO", f"Dilewati: {reason}")
-
-
 async def stats():
     rows = await q("SELECT key, value FROM counters WHERE key LIKE 'stat:%'")
     return {r["key"][5:]: r["value"] for r in rows}
@@ -205,6 +255,11 @@ async def stats():
 async def log_(level, text):
     await x("INSERT INTO logs(ts, level, text) VALUES(?, ?, ?)", (int(time.time()), level, text[:300]))
     await x("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 200)")
+
+
+async def skip(reason):
+    await stat("skipped")
+    await log_("INFO", f"Dilewati: {reason}")
 
 
 async def user(uid):
@@ -230,6 +285,67 @@ async def hist_get(key, n=12):
     )
 
 
+async def claim(chat_id, post_id):
+    """True hanya untuk pemanggil pertama, sehingga satu postingan tidak dibalas dua kali."""
+    cur = await db.execute("INSERT OR IGNORE INTO seen(chat_id, post_id) VALUES(?, ?)", (chat_id, post_id))
+    await db.commit()
+    return cur.rowcount == 1
+
+
+async def cursor_get(chat_id):
+    rows = await q("SELECT last_id FROM cursor WHERE chat_id=?", (chat_id,))
+    return rows[0]["last_id"] if rows else None
+
+
+async def cursor_bump(chat_id, post_id):
+    await x(
+        "INSERT INTO cursor(chat_id, last_id) VALUES(?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
+        (chat_id, post_id),
+    )
+
+
+# ---------- notifikasi & laporan ke owner ----------
+
+async def notify(text):
+    if bot and (await settings())["notify"]:
+        try:
+            await bot.send_message(OWNER_ID, text)
+        except Exception:
+            pass
+
+
+async def report(title, body, key=None, every=20):
+    """Kirim penjelasan ke owner. Laporan sejenis digabung supaya tidak membanjiri chat."""
+    k = key or title
+    now = time.time()
+    last, n = REPORT_AT.get(k, (0.0, 0))
+    if now - last < every:
+        REPORT_AT[k] = (last, n + 1)
+        return
+    REPORT_AT[k] = (now, 0)
+    extra = f"\n➕ {n} kejadian serupa sejak laporan terakhir." if n else ""
+    await notify(f"<b>{title}</b>\n🕒 {fmt()}\n{body}{extra}")
+
+
+def explain(e):
+    """Terjemahkan error Telegram menjadi penjelasan yang mudah dipahami."""
+    name = type(e).__name__
+    secs = getattr(e, "seconds", None)
+    table = {
+        "FloodWaitError": f"Telegram membatasi kecepatan kirim (FloodWait {secs} detik).",
+        "SlowModeWaitError": f"Grup diskusi memakai slow mode ({secs} detik).",
+        "PeerFloodError": "Akun ditandai spam oleh Telegram. Kurangi frekuensi balasan.",
+        "UserNotParticipantError": "Userbot belum join grup diskusi.",
+        "ChannelPrivateError": "Grup diskusi privat dan userbot tidak punya akses (belum join atau dikeluarkan).",
+        "ChatWriteForbiddenError": "Userbot tidak boleh mengirim pesan di grup diskusi (dibatasi atau grup hanya-baca).",
+        "UserBannedInChannelError": "Akun userbot dibatasi untuk mengirim pesan di grup tersebut.",
+        "ChatGuestSendForbiddenError": "Userbot harus join grup diskusi dulu sebelum bisa komentar.",
+        "MsgIdInvalidError": "Postingan tidak punya kolom komentar (komentar mati atau belum tersambung ke grup diskusi).",
+    }
+    return table.get(name, f"{name}: {short(e)}")
+
+
 # ---------- AI ----------
 
 def is_skip(text):
@@ -238,17 +354,39 @@ def is_skip(text):
 
 def system_prompt(s, mode):
     persona = s["prompt"].strip() or PERSONAS[s["persona"]][1]
-    return (
-        f"{persona}\n{STYLES[s['style']][1]}\n{MODE_TEXT[mode]}\n\n"
-        "Aturan wajib:\n"
-        "- Balas dalam Bahasa Indonesia, singkat, seperti chat sungguhan.\n"
-        "- Jika ditanya, jujur bahwa kamu asisten AI. Jangan mengaku manusia.\n"
-        "- Jangan menghina, memprovokasi, membahas SARA, pornografi, atau kekerasan.\n"
-        "- Jangan meminta atau membagikan data pribadi.\n"
-        "- Jangan memaksakan percakapan. Tutup dengan sopan jika sudah cukup.\n"
-        "- Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP\n"
-        "- Keluarkan hanya teks balasan."
-    )
+    rules = [
+        "Balas dalam Bahasa Indonesia, singkat (1-2 kalimat), seperti chat sungguhan.",
+        "Jika ditanya langsung, jujur bahwa kamu asisten AI. Jangan mengaku manusia.",
+        "Jangan menghina, memprovokasi, membahas SARA, konten seksual, atau kekerasan.",
+        "Jangan meminta atau membagikan data pribadi.",
+        "Jangan memaksakan percakapan.",
+        "Keluarkan hanya teks balasan, tanpa label atau tanda kutip.",
+    ]
+    if mode != "menfess":
+        rules.insert(4, "Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP")
+    body = "\n".join(f"- {r}" for r in rules)
+    return f"{persona}\n{STYLES[s['style']][1]}\n{MODE_TEXT[mode]}\n\nAturan wajib:\n{body}"
+
+
+def merge_roles(msgs):
+    out = []
+    for m in msgs:
+        if out and out[-1]["role"] == m["role"]:
+            out[-1] = {"role": m["role"], "content": out[-1]["content"] + "\n" + m["content"]}
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
+
+
+def http_err(code):
+    hint = {
+        400: "permintaan ditolak (cek nama model)",
+        401: "API key salah",
+        403: "API key ditolak atau wilayah tidak didukung",
+        404: "nama model tidak ditemukan",
+        429: "kuota habis atau terlalu banyak permintaan",
+    }.get(code, "server provider bermasalah" if code >= 500 else "error tidak dikenal")
+    return f"HTTP {code}: {hint}"
 
 
 async def call(http, name, model, system, msgs):
@@ -263,12 +401,18 @@ async def call(http, name, model, system, msgs):
                      "parts": [{"text": m["content"]}]}
                     for m in msgs
                 ],
-                "generationConfig": {"temperature": 0.9, "maxOutputTokens": 600},
+                "generationConfig": {"temperature": 0.9, "maxOutputTokens": 1024},
             },
         )
         if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            raise RuntimeError(http_err(r.status_code))
+        data = r.json()
+        cands = data.get("candidates") or []
+        if not cands:
+            block = (data.get("promptFeedback") or {}).get("blockReason")
+            raise RuntimeError(f"diblokir filter keamanan ({block})" if block else "respons kosong")
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        return "".join(p.get("text", "") for p in parts)
 
     r = await http.post(
         URLS[name],
@@ -277,39 +421,58 @@ async def call(http, name, model, system, msgs):
               "temperature": 0.9, "max_tokens": 300},
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}")
+        raise RuntimeError(http_err(r.status_code))
     return r.json()["choices"][0]["message"]["content"]
 
 
 async def ask_ai(mode, msgs, s):
-    """Coba provider sesuai urutan. Kalau semua gagal, raise AIError."""
+    """Coba provider sesuai urutan. Kalau semua gagal, raise AIError berisi alasan tiap provider."""
     system = system_prompt(s, mode)
+    msgs = merge_roles(msgs)
     errs = []
     async with httpx.AsyncClient(timeout=30) as http:
         for name in s["order"]:
-            if name in s["disabled"] or not KEYS.get(name):
+            if name in s["disabled"]:
+                errs.append(f"{NAMES[name]}: dimatikan di panel")
+                continue
+            if not KEYS.get(name):
+                errs.append(f"{NAMES[name]}: API key belum diisi")
                 continue
             try:
                 text = (await call(http, name, s[f"model_{name}"], system, msgs) or "").strip()
+                text = text.strip("\"'").strip()
                 if text:
-                    return text
-                errs.append(f"{name}: kosong")
+                    if s["style"] == "x":
+                        text = text.lower()
+                    return text[:600]
+                errs.append(f"{NAMES[name]}: respons kosong")
             except Exception as e:
-                errs.append(f"{name}: {str(e)[:80]}")
-    raise AIError("; ".join(errs) or "tidak ada provider aktif")
+                errs.append(f"{NAMES[name]}: {short(e)}")
+    raise AIError(" | ".join(errs) or "tidak ada provider aktif")
+
+
+async def test_providers(s):
+    lines = []
+    async with httpx.AsyncClient(timeout=25) as http:
+        for name in s["order"]:
+            label = f"{NAMES[name]} · {s['model_' + name]}"
+            if not KEYS.get(name):
+                lines.append(f"⚪ {label}: API key belum diisi")
+                continue
+            t0 = time.time()
+            try:
+                await call(http, name, s[f"model_{name}"], "Balas singkat.",
+                           [{"role": "user", "content": "Balas satu kata: halo"}])
+                lines.append(f"✅ {label}: bisa dipakai ({time.time() - t0:.1f} dtk)")
+            except Exception as e:
+                lines.append(f"❌ {label}: {short(e)}")
+    return lines
 
 
 async def humanize(s):
     lo, hi = sorted((s["delay_min"], s["delay_max"]))
-    await asyncio.sleep(random.uniform(lo, hi))
-
-
-async def notify(text):
-    if bot and (await settings())["notify"]:
-        try:
-            await bot.send_message(OWNER_ID, text)
-        except Exception:
-            pass
+    if hi > 0:
+        await asyncio.sleep(random.uniform(lo, hi))
 
 
 # ---------- userbot ----------
@@ -329,32 +492,74 @@ async def find_root(m):
 
 class UB:
     def __init__(self, string):
-        self.c = TelegramClient(StringSession(string or ""), API_ID, API_HASH)
+        self.string = string or ""
+        self.c = TelegramClient(StringSession(self.string), API_ID, API_HASH)
         self.me = None
         self.ready = False
-        self.by_disc = {}
+        self.chans = {}    # chat_id channel -> baris database
+        self.by_disc = {}  # chat_id grup diskusi -> baris database
+        self.ents = {}     # chat_id channel -> entity
+        self.groups = {}   # chat_id grup diskusi -> entity
+        self.albums = set()
+        self.joined = set()
         self.ai_at = {}
         self.tasks = set()
-        self.alert_at = 0.0
+        self.poller = None
 
     async def start(self):
         await self.c.connect()
         if not await self.c.is_user_authorized():
-            raise RuntimeError("session kosong atau tidak valid")
+            raise RuntimeError("session kosong, tidak valid, atau sudah logout")
         self.me = await self.c.get_me()
+        try:
+            # Memuat dialog supaya Telethon mengenal grup diskusi dan menerima update-nya.
+            await self.c.get_dialogs(limit=200)
+        except Exception as e:
+            log.warning("get_dialogs gagal: %s", e)
         self.c.add_event_handler(self.on_in, events.NewMessage(incoming=True))
         self.c.add_event_handler(self.on_out, events.NewMessage(outgoing=True))
         await self.refresh()
         self.ready = True
+        self.poller = asyncio.create_task(self.poll_loop())
         log.info("Userbot aktif sebagai %s", self.me.first_name)
 
     async def stop(self):
         self.ready = False
+        if self.poller:
+            self.poller.cancel()
+            try:
+                await self.poller
+            except (asyncio.CancelledError, Exception):
+                pass
+        for t in list(self.tasks):
+            t.cancel()
+        try:
+            self.c.remove_event_handler(self.on_in)
+            self.c.remove_event_handler(self.on_out)
+        except Exception:
+            pass
         await self.c.disconnect()
+
+    async def load(self, row):
+        ent = await self.c.get_entity(row["username"])
+        full = await self.c(GetFullChannelRequest(ent))
+        linked = full.full_chat.linked_chat_id
+        self.ents[row["chat_id"]] = ent
+        for chat in full.chats:
+            if linked and chat.id == linked:
+                self.groups[row["disc_id"]] = chat
+        return ent, full
 
     async def refresh(self):
         rows = await q("SELECT * FROM channels")
+        self.chans = {r["chat_id"]: r for r in rows}
         self.by_disc = {r["disc_id"]: r for r in rows if r["disc_id"]}
+        for r in rows:
+            if r["chat_id"] not in self.ents:
+                try:
+                    await self.load(r)
+                except Exception as e:
+                    await log_("ERROR", f"Gagal memuat @{r['username']}: {short(e)}")
 
     async def resolve(self, name):
         ent = await self.c.get_entity(name)
@@ -363,15 +568,62 @@ class UB:
         full = await self.c(GetFullChannelRequest(ent))
         linked = full.full_chat.linked_chat_id
         if not linked:
-            raise ValueError("channel belum punya discussion group")
-        return {
-            "username": name,
-            "chat_id": utils.get_peer_id(ent),
-            "disc_id": utils.get_peer_id(PeerChannel(linked)),
-            "title": ent.title,
-        }
+            raise ValueError("channel belum punya grup diskusi (kolom komentar mati)")
+        chat_id = utils.get_peer_id(ent)
+        disc_id = utils.get_peer_id(PeerChannel(linked))
+        self.ents[chat_id] = ent
+        for chat in full.chats:
+            if chat.id == linked:
+                self.groups[disc_id] = chat
+        return {"username": name, "chat_id": chat_id, "disc_id": disc_id, "title": ent.title}
 
-    # setiap event diproses di task sendiri agar delay tidak memblokir update lain
+    # ----- diagnostik -----
+    async def diagnose(self, ch):
+        out = []
+        try:
+            ent = self.ents.get(ch["chat_id"]) or (await self.load(ch))[0]
+            out.append("✅ Channel terbaca")
+        except Exception as e:
+            return [f"❌ Channel tidak terbaca: {esc(short(e))}"]
+        try:
+            await self.c.get_permissions(ent, self.me)
+            out.append("✅ Userbot subscriber channel (deteksi realtime)")
+        except errors.UserNotParticipantError:
+            out.append(f"⚠️ Userbot belum subscribe channel. Deteksi lewat cek berkala tiap {POLL_SEC} detik, tetap jalan.")
+        except Exception as e:
+            out.append(f"⚠️ Status subscribe tidak diketahui: {esc(short(e))}")
+        try:
+            full = await self.c(GetFullChannelRequest(ent))
+            linked = full.full_chat.linked_chat_id
+        except Exception as e:
+            return out + [f"❌ Gagal membaca info channel: {esc(short(e))}"]
+        if not linked:
+            return out + ["❌ Channel belum terhubung ke grup diskusi (kolom komentar mati)"]
+        grp = next((c for c in full.chats if c.id == linked), None)
+        out.append(f"✅ Grup diskusi: {esc(grp.title) if grp else linked}")
+        if grp is not None:
+            try:
+                await self.c.get_permissions(grp, self.me)
+                out.append("✅ Userbot sudah join grup diskusi")
+            except errors.UserNotParticipantError:
+                out.append("❌ Userbot BELUM join grup diskusi. Join dulu supaya bisa komentar.")
+            except Exception as e:
+                out.append(f"⚠️ Status join grup tidak diketahui: {esc(short(e))}")
+            rights = getattr(grp, "default_banned_rights", None)
+            if rights is not None and getattr(rights, "send_messages", False):
+                out.append("❌ Grup melarang anggota mengirim pesan")
+        try:
+            last = await self.c.get_messages(ent, limit=1)
+            if last:
+                await self.c(GetDiscussionMessageRequest(peer=ent, msg_id=last[0].id))
+                out.append(f"✅ Komentar aktif di postingan terakhir (#{last[0].id})")
+        except errors.MsgIdInvalidError:
+            out.append("❌ Postingan terakhir tidak punya kolom komentar")
+        except Exception as e:
+            out.append(f"⚠️ Cek komentar gagal: {esc(short(e))}")
+        return out
+
+    # ----- penerimaan event -----
     def spawn(self, coro):
         t = asyncio.create_task(self.guard(coro))
         self.tasks.add(t)
@@ -380,20 +632,24 @@ class UB:
     async def guard(self, coro):
         try:
             await coro
+        except asyncio.CancelledError:
+            raise
         except AIError as e:
             await stat("error")
             await log_("ERROR", f"AI gagal: {e}")
-            if time.time() - self.alert_at > 900:
-                self.alert_at = time.time()
-                await notify(f"⚠️ Semua provider AI gagal:\n<code>{html.escape(str(e)[:250])}</code>")
+            await report("❌ AI gagal membalas", f"❓ {esc(str(e))}", key="ai", every=60)
         except Exception as e:
             log.exception("handler")
             await stat("error")
-            await log_("ERROR", repr(e))
+            await log_("ERROR", repr(e)[:250])
+            await report("❌ Error tak terduga", f"❓ {esc(explain(e))}", key="exc", every=60)
 
     async def on_in(self, ev):
         if ev.is_private:
             self.spawn(self.dm(ev))
+        elif ev.chat_id in self.chans:
+            if not ev.message.action:
+                self.spawn(self.on_post(ev.message, self.chans[ev.chat_id], "realtime"))
         elif ev.chat_id in self.by_disc:
             self.spawn(self.group(ev))
 
@@ -401,57 +657,203 @@ class UB:
         if ev.is_private and ev.chat_id != self.me.id:
             self.spawn(self.takeover(ev))
 
-    async def say(self, chat, text, reply_to=None):
-        # Catat waktu sebelum kirim, supaya pesan ini tidak dianggap takeover.
-        self.ai_at[chat] = time.time()
-        await self.c.send_message(chat, text, reply_to=reply_to)
+    # ----- cek berkala (cadangan kalau update realtime tidak masuk) -----
+    async def poll_loop(self):
+        await asyncio.sleep(3)
+        while self.ready:
+            for ch in list(self.chans.values()):
+                if not self.ready:
+                    break
+                try:
+                    await self.poll(ch)
+                except errors.FloodWaitError as e:
+                    await asyncio.sleep(min(e.seconds + 1, 120))
+                except Exception as e:
+                    await log_("ERROR", f"Cek @{ch['username']} gagal: {short(e)}")
+                    await report(
+                        "⚠️ Gagal mengecek channel",
+                        f"📡 @{esc(ch['username'])}\n❓ {esc(explain(e))}",
+                        key=f"poll:{ch['username']}", every=300,
+                    )
+            await asyncio.sleep(POLL_SEC)
 
-    async def send(self, chat, text, reply_to=None):
-        async with self.c.action(chat, "typing"):
-            await asyncio.sleep(min(1.5 + len(text) * 0.05, 8))
-        await self.say(chat, text, reply_to)
+    async def poll(self, ch):
+        ent = self.ents.get(ch["chat_id"])
+        if ent is None:
+            ent = (await self.load(ch))[0]
+        cur = await cursor_get(ch["chat_id"])
+        if cur is None:
+            last = await self.c.get_messages(ent, limit=1)
+            await cursor_bump(ch["chat_id"], last[0].id if last else 0)
+            return
+        msgs = await self.c.get_messages(ent, limit=30, min_id=cur)
+        msgs = [m for m in msgs if m]
+        for m in sorted((m for m in msgs if not m.action), key=lambda m: m.id):
+            await self.on_post(m, ch, "cek berkala")
+        if msgs:
+            await cursor_bump(ch["chat_id"], max(m.id for m in msgs))
 
-    # A. komentar menfess, B. balas reply
+    # ----- A. menfess masuk channel -----
     async def group(self, ev):
         ch = self.by_disc[ev.chat_id]
         msg = ev.message
-        s = await settings()
         fwd = msg.fwd_from
         from_channel = bool(
-            fwd and fwd.channel_post and fwd.from_id and utils.get_peer_id(fwd.from_id) == ch["chat_id"]
+            fwd and fwd.channel_post and (
+                (fwd.from_id and utils.get_peer_id(fwd.from_id) == ch["chat_id"])
+                or (not fwd.from_id and msg.sender_id == 777000)
+            )
         )
         if from_channel:
-            return await self.menfess(msg, ch, s)
+            return await self.on_post(None, ch, "grup diskusi", group_msg=msg)
         if msg.reply_to_msg_id and msg.sender_id != self.me.id:
-            return await self.reply(msg, s)
+            return await self.reply(msg, await settings())
 
-    async def menfess(self, msg, ch, s):
-        if ch["paused"] or not s["comment_on"]:
-            return await skip("channel dijeda atau komentar nonaktif")
-        text = (msg.message or "").strip()
-        if len(text) < s["min_len"]:
-            return await skip(f"menfess terlalu pendek ({len(text)} karakter)")
-        if s["reply_prob"] < 100 and random.uniform(0, 100) > s["reply_prob"]:
-            return await skip("kena peluang balas")
-        if s["keywords"] and not any(k.lower() in text.lower() for k in s["keywords"]):
-            return await skip("tidak ada keyword yang cocok")
-        hk = f"hour:{datetime.now():%Y%m%d%H}:c"
-        if await count(hk) >= s["max_comment_hour"]:
-            return await skip("batas komentar per jam tercapai")
+    async def on_post(self, msg, ch, src, group_msg=None):
+        base = msg if msg is not None else group_msg
+        post_id = msg.id if msg is not None else group_msg.fwd_from.channel_post
+        if not await claim(ch["chat_id"], post_id):
+            return  # sudah ditangani jalur lain
+        await cursor_bump(ch["chat_id"], post_id)
 
-        await log_("INFO", f"Menfess #{msg.id} diproses")
+        gid = getattr(base, "grouped_id", None)
+        if gid:
+            key = (ch["chat_id"], gid)
+            if key in self.albums:
+                return  # bagian lain dari album yang sama
+            if len(self.albums) > 500:
+                self.albums.clear()
+            self.albums.add(key)
+
+        s = await settings()
+        text = (base.message or "").strip()
+        LAST.update(id=post_id, ts=time.time(), ch=ch["username"])
+        await log_("INFO", f"Terdeteksi menfess #{post_id} di @{ch['username']} ({len(text)} karakter) via {src}")
+
+        age = (datetime.now(timezone.utc) - base.date).total_seconds()
+        reason = None
+        if ch["paused"]:
+            reason = "Channel sedang dijeda di panel."
+        elif not s["comment_on"]:
+            reason = "Fitur Komentar Menfess dimatikan di Mode Chat."
+        elif age > s["max_age_min"] * 60:
+            reason = (f"Postingan berumur {int(age // 60)} menit (batas {s['max_age_min']} menit). "
+                      "Kemungkinan bot sempat mati.")
+        elif len(text) < s["min_len"]:
+            reason = f"Teks {len(text)} karakter, di bawah batas minimal {s['min_len']}."
+        elif s["reply_prob"] < 100 and random.uniform(0, 100) > s["reply_prob"]:
+            reason = f"Terkena peluang balas {s['reply_prob']}%."
+        elif s["keywords"] and not any(k.lower() in text.lower() for k in s["keywords"]):
+            reason = "Tidak ada keyword filter yang cocok."
+        if reason:
+            await skip(f"#{post_id}: {reason}")
+            return await report(
+                "⏭ Menfess tidak dibalas", f"{self.ctx(ch, post_id, text)}\n❓ {esc(reason)}",
+                key="skip:" + reason[:18], every=30,
+            )
+        self.spawn(self.reply_post(ch, post_id, text, group_msg, s))
+
+    @staticmethod
+    def ctx(ch, post_id, text):
+        return f"📡 @{esc(ch['username'])} · menfess #{post_id}\n📝 {esc(text[:80]) or '[tanpa teks]'}"
+
+    async def reply_post(self, ch, post_id, text, group_msg, s):
+        ctx = self.ctx(ch, post_id, text)
+        hk = f"hour:{now_wib():%Y%m%d%H}:c"
+        if s["max_comment_hour"] > 0 and await count(hk) >= s["max_comment_hour"]:
+            await skip(f"#{post_id}: batas komentar per jam")
+            return await report("⏭ Menfess tidak dibalas",
+                                f"{ctx}\n❓ Batas komentar per jam ({s['max_comment_hour']}) tercapai.", key="hourlimit")
+
         await humanize(s)
-        # Menfess foto/video tanpa teks tetap dibalas, dengan konteks umum.
-        content = text[:800] or "(menfess ini berupa foto atau video tanpa teks)"
-        prompt = f'Menfess:\n"""\n{content}\n"""\nTulis satu komentar singkat.'
-        reply = await ask_ai("menfess", [{"role": "user", "content": prompt}], s)
+        content = text[:800] or "(menfess ini berupa foto, video, atau stiker tanpa teks)"
+        prompt = (
+            f'Menfess:\n"""\n{content}\n"""\n'
+            "Tulis satu komentar singkat untuk menfess ini. Jangan jawab SKIP."
+        )
+        reply, last_err = None, ""
+        for attempt in range(1, 4):
+            try:
+                async with AI_SEM:
+                    reply = await ask_ai("menfess", [{"role": "user", "content": prompt}], s)
+                break
+            except AIError as e:
+                last_err = str(e)
+                await log_("ERROR", f"AI gagal #{post_id} (percobaan {attempt}/3): {last_err}")
+                if attempt < 3:
+                    await asyncio.sleep(8 * attempt)
+        if reply is None:
+            await stat("error")
+            return await report(
+                "❌ Menfess tidak dibalas: AI gagal",
+                f"{ctx}\n❓ {esc(last_err)}\n💡 Buka Pengaturan AI → Tes AI untuk memeriksa tiap provider.",
+                key="ai",
+            )
         if is_skip(reply):
-            return await skip("AI memilih SKIP")
-        await self.send(msg.chat_id, reply, msg.id)
+            await skip(f"#{post_id}: AI menolak membalas")
+            return await report(
+                "⏭ Menfess tidak dibalas",
+                f"{ctx}\n❓ AI menolak membalas (kemungkinan isi menfess sensitif).", key="aiskip",
+            )
+
+        try:
+            await self.deliver(ch, post_id, reply, group_msg)
+        except Exception as e:
+            await stat("error")
+            await log_("ERROR", f"Gagal kirim #{post_id}: {type(e).__name__}")
+            return await report(
+                "❌ Menfess tidak dibalas: gagal kirim komentar",
+                f"{ctx}\n❓ {esc(explain(e))}", key=f"send:{type(e).__name__}",
+            )
         await incr(hk)
         await stat("comment")
-        await log_("INFO", f"Komentar terkirim ke menfess #{msg.id}")
+        await log_("INFO", f"Komentar terkirim ke #{post_id}: {reply[:60]}")
+        if s["notify_ok"]:
+            await notify(f"✅ <b>Komentar terkirim</b>\n🕒 {fmt()}\n{ctx}\n💬 {esc(reply[:120])}")
 
+    async def typing(self, chat, secs):
+        try:
+            async with self.c.action(chat, "typing"):
+                await asyncio.sleep(secs)
+        except Exception:
+            pass
+
+    async def deliver(self, ch, post_id, reply, group_msg):
+        disc_id = ch["disc_id"]
+        async with SEND_LOCK:
+            for attempt in range(6):
+                try:
+                    secs = min(1 + len(reply) * 0.04, 5)
+                    if group_msg is not None:
+                        await self.typing(group_msg.chat_id, secs)
+                        await self.c.send_message(group_msg.chat_id, reply, reply_to=group_msg.id)
+                    else:
+                        ent = self.ents.get(ch["chat_id"])
+                        if ent is None:
+                            ent = (await self.load(ch))[0]
+                        await self.typing(self.groups.get(disc_id) or disc_id, secs)
+                        await self.c.send_message(ent, reply, comment_to=post_id)
+                    await asyncio.sleep(SEND_GAP)
+                    return
+                except errors.MsgIdInvalidError:
+                    # Salinan postingan di grup diskusi kadang belum muncul. Tunggu sebentar lalu coba lagi.
+                    if attempt >= 4:
+                        raise
+                    await asyncio.sleep(3)
+                except (errors.FloodWaitError, errors.SlowModeWaitError) as e:
+                    wait = getattr(e, "seconds", 30)
+                    if wait > 120 or attempt >= 5:
+                        raise
+                    await asyncio.sleep(wait + 1)
+                except (errors.UserNotParticipantError, errors.ChannelPrivateError):
+                    grp = self.groups.get(disc_id)
+                    if attempt >= 1 or disc_id in self.joined or grp is None:
+                        raise
+                    self.joined.add(disc_id)
+                    await self.c(JoinChannelRequest(grp))  # coba join otomatis
+                    await asyncio.sleep(2)
+
+    # ----- B. balas reply ke komentar userbot -----
     async def reply(self, msg, s):
         if not s["reply_on"]:
             return
@@ -474,13 +876,13 @@ class UB:
         if CLOSING.match(text):
             await incr(closed)
             return await skip("pesan penutup")
-        day = f"day:{uid}:{datetime.now():%Y%m%d}"
+        day = f"day:{uid}:{now_wib():%Y%m%d}"
         if await count(f"n:{thread}") >= s["max_thread"]:
             return await skip("batas balasan per thread tercapai")
         if await count(day) >= s["max_user_day"]:
             return await skip("batas balasan per user tercapai")
         if random.uniform(0, 100) > s["thread_prob"]:
-            return await skip("kena peluang balas reply")
+            return await skip("reply kena peluang balas")
 
         sender = await msg.get_sender()
         name = getattr(sender, "first_name", None) or "Seseorang"
@@ -488,16 +890,25 @@ class UB:
         await humanize(s)
         post = (root.message or "")[:500]
         msgs = [{"role": "user", "content": f"Menfess asli:\n{post}"}] + await hist_get(thread, 10)
-        reply = await ask_ai("reply", msgs, s)
+        async with AI_SEM:
+            reply = await ask_ai("reply", msgs, s)
         if is_skip(reply):
             return await skip("AI memilih SKIP")
-        await self.send(msg.chat_id, reply, msg.id)
+        async with SEND_LOCK:
+            await self.typing(msg.chat_id, min(1 + len(reply) * 0.04, 5))
+            self.ai_at[msg.chat_id] = time.time()
+            await self.c.send_message(msg.chat_id, reply, reply_to=msg.id)
+            await asyncio.sleep(SEND_GAP)
         await hist_add(thread, "assistant", reply)
         await incr(f"n:{thread}")
         await incr(day)
         await stat("reply")
 
-    # C. DM
+    # ----- C. DM -----
+    async def say(self, chat, text):
+        self.ai_at[chat] = time.time()  # dicatat sebelum kirim supaya tidak dianggap takeover
+        await self.c.send_message(chat, text)
+
     async def dm(self, ev):
         uid = ev.sender_id
         if not uid or uid == self.me.id:
@@ -518,7 +929,7 @@ class UB:
             return
         if s["dm_whitelist"] and u["lst"] != "white":
             return
-        hk = f"dm:{uid}:{datetime.now():%Y%m%d%H}"
+        hk = f"dm:{uid}:{now_wib():%Y%m%d%H}"
         if await count(hk) >= s["dm_hour"]:
             return await skip("batas DM per jam tercapai")
         if not u["greeted"]:
@@ -528,16 +939,18 @@ class UB:
         key = f"dm:{uid}"
         await hist_add(key, "user", text)
         await humanize(s)
-        reply = await ask_ai("dm", await hist_get(key, 12), s)
+        async with AI_SEM:
+            reply = await ask_ai("dm", await hist_get(key, 12), s)
         if is_skip(reply):
             return await skip("AI memilih SKIP")
-        await self.send(uid, reply)
+        await self.typing(uid, min(1 + len(reply) * 0.04, 5))
+        await self.say(uid, reply)
         await hist_add(key, "assistant", reply)
         await incr(hk)
         await stat("dm")
 
     async def takeover(self, ev):
-        """Jika kamu mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
+        """Kalau kamu mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
         uid = ev.chat_id
         if time.time() - self.ai_at.get(uid, 0) < 10:
             return
@@ -576,8 +989,11 @@ async def verify_string(string):
 
 
 async def activate(string):
-    """Mulai userbot baru dengan session ini, lalu simpan ke database."""
+    """Mulai userbot dengan session ini, lalu simpan ke database."""
     global ub
+    old_string = ub.string if ub else None
+    if ub:
+        await ub.stop()
     new = UB(string)
     try:
         await new.start()
@@ -586,13 +1002,15 @@ async def activate(string):
             await new.stop()
         except Exception:
             pass
-        return False, str(e)
-    old, ub = ub, new
-    if old:
-        try:
-            await old.stop()
-        except Exception:
-            pass
+        if old_string:  # kembalikan userbot lama
+            back_ub = UB(old_string)
+            try:
+                await back_ub.start()
+            except Exception:
+                pass
+            ub = back_ub
+        return False, short(e)
+    ub = new
     await setv("session", string)
     return True, ""
 
@@ -615,7 +1033,7 @@ class CB(CallbackData, prefix="c"):
 
 
 def B(text, a, b=""):
-    # Data tombol memakai "|" sebagai pemisah di dalam b, bukan ":".
+    # Pemisah di dalam b adalah "|" (bukan ":"), karena ":" dipakai aiogram.
     return InlineKeyboardButton(text=text, callback_data=CB(a=a, b=b).pack())
 
 
@@ -657,14 +1075,20 @@ async def scr_home(_=""):
     chans = await q("SELECT paused FROM channels")
     st = await stats()
     total = st.get("comment", 0) + st.get("reply", 0) + st.get("dm", 0)
-    status = "🟢 Online" if ub and ub.ready else "🔴 Offline"
+    online = bool(ub and ub.ready)
     active = sum(1 for c in chans if not c["paused"])
+    if LAST:
+        last = f"#{LAST['id']} di @{esc(LAST['ch'])} · {fmt_short(LAST['ts'])}"
+    else:
+        last = "belum ada sejak bot menyala"
     text = (
         "<b>🏠 Beranda</b>\n━━━━━━━━━━━━━━━━\n"
-        f"🤖 Userbot : {status}\n"
+        f"🤖 Userbot : {'🟢 Online' if online else '🔴 Offline'}\n"
         f"📡 Channel : {len(chans)} ({active} aktif)\n"
         f"💬 Total balasan : {total}\n"
-        f"🧠 AI : {html.escape(active_ai(s))}"
+        f"📨 Postingan terakhir : {last}\n"
+        f"🧠 AI : {esc(active_ai(s))}\n"
+        f"🕒 {fmt()}"
     )
     rows = [
         [B("📡 Channel", "chan"), B("🤖 Pengaturan AI", "ai")],
@@ -677,11 +1101,10 @@ async def scr_home(_=""):
 async def scr_chan(_=""):
     chans = await q("SELECT * FROM channels ORDER BY username")
     body = "\n".join(
-        f"{'⏸' if c['paused'] else '🟢'} @{html.escape(c['username'])} · {html.escape(c['title'] or '-')}"
-        for c in chans
+        f"{'⏸' if c['paused'] else '🟢'} @{esc(c['username'])} · {esc(c['title'] or '-')}" for c in chans
     ) or "<i>Belum ada channel.</i>"
     rows = [[B(f"{'⏸' if c['paused'] else '🟢'} @{c['username']}", "chanv", c["username"])] for c in chans]
-    rows.append([B("➕ Tambah Channel", "in", "channel")])
+    rows.append([B("➕ Tambah Channel", "in", "channel"), B("🩺 Diagnostik", "diag")])
     return f"<b>📡 Channel Menfess</b>\n\n{body}", rows + back()
 
 
@@ -691,15 +1114,34 @@ async def scr_chanv(username=""):
         return await scr_chan()
     c = rows_[0]
     text = (
-        f"<b>📡 @{html.escape(c['username'])}</b>\n\n"
-        f"Judul : {html.escape(c['title'] or '-')}\n"
+        f"<b>📡 @{esc(c['username'])}</b>\n\n"
+        f"Judul : {esc(c['title'] or '-')}\n"
         f"Status : {'⏸ Dijeda' if c['paused'] else '🟢 Aktif'}\n"
         f"Diskusi ID : <code>{c['disc_id']}</code>"
     )
-    rows = [[
-        B("▶️ Lanjutkan" if c["paused"] else "⏸ Jeda", "pause", username),
-        B("🗑 Hapus", "ask", f"delchan|{username}"),
-    ]]
+    rows = [
+        [B("▶️ Lanjutkan" if c["paused"] else "⏸ Jeda", "pause", username),
+         B("🗑 Hapus", "ask", f"delchan|{username}")],
+        [B("🩺 Diagnostik channel ini", "diag", username)],
+    ]
+    return text, rows + back("chan")
+
+
+async def scr_diag(arg=""):
+    if not ub or not ub.ready:
+        return "<b>🩺 Diagnostik</b>\n\n🔴 Userbot offline. Buat atau aktifkan session di menu 🔑 Session.", back("chan")
+    if arg:
+        chans = await q("SELECT * FROM channels WHERE username=?", (arg,))
+    else:
+        chans = await q("SELECT * FROM channels ORDER BY username")
+    if not chans:
+        return "<b>🩺 Diagnostik</b>\n\nBelum ada channel. Tambahkan dulu di menu Channel.", back("chan")
+    parts = []
+    for ch in chans:
+        lines = await ub.diagnose(ch)
+        parts.append(f"<b>@{esc(ch['username'])}</b>\n" + "\n".join(lines))
+    text = "<b>🩺 Diagnostik</b>\n🕒 " + fmt() + "\n\n" + "\n\n".join(parts)
+    rows = [[B("🔄 Periksa ulang", "diag", arg)]]
     return text, rows + back("chan")
 
 
@@ -708,7 +1150,7 @@ async def scr_ai(_=""):
     text = (
         "<b>🤖 Pengaturan AI</b>\n\n"
         f"Urutan : {' → '.join(NAMES[p] for p in s['order'])}\n"
-        f"Aktif : {html.escape(active_ai(s))}\n"
+        f"Aktif : {esc(active_ai(s))}\n"
         f"Persona : {PERSONAS[s['persona']][0]}\n"
         f"Gaya : {STYLES[s['style']][0]}\n"
         f"Prompt kustom : {'aktif' if s['prompt'] else 'nonaktif'}"
@@ -717,8 +1159,17 @@ async def scr_ai(_=""):
         [B("🔀 Urutan", "aiord"), B("🧩 Model", "aimdl")],
         [B("🎭 Persona", "aipers"), B("✍️ Gaya", "aisty")],
         [B("📝 Prompt Kustom", "in", "prompt"), B("♻️ Reset Prompt", "rprompt")],
+        [B("🧪 Tes AI", "aitest")],
     ]
     return text, rows + back()
+
+
+async def scr_aitest(_=""):
+    s = await settings()
+    lines = await test_providers(s)
+    text = "<b>🧪 Tes AI</b>\n🕒 " + fmt() + "\n\n" + "\n".join(esc(line) for line in lines)
+    text += "\n\n<i>✅ berarti provider itu bisa dipakai. ❌ menjelaskan penyebabnya.</i>"
+    return text, [[B("🔄 Tes ulang", "aitest")]] + back("ai")
 
 
 async def scr_aiord(_=""):
@@ -726,7 +1177,7 @@ async def scr_aiord(_=""):
     presets = [[B(" → ".join(NAMES[p] for p in perm), "set", f"order|{','.join(perm)}")]
                for perm in permutations(NAMES)]
     toggles = [B(f"{'⛔' if p in s['disabled'] else '✅'} {NAMES[p]}", "prov", p) for p in NAMES]
-    text = "<b>🔀 Urutan Provider</b>\n\nJika satu provider gagal, sistem mencoba provider berikutnya."
+    text = "<b>🔀 Urutan Provider</b>\n\nJika satu provider gagal, bot mencoba provider berikutnya."
     return text, presets + chunk(toggles) + back("ai")
 
 
@@ -736,7 +1187,7 @@ async def scr_aimdl(_=""):
         B(f"{'✅ ' if s['model_' + p] == m else ''}{NAMES[p]} · {m.split('/')[-1][:22]}", "mdl", f"{p}|{i}")
         for p in NAMES for i, m in enumerate(MODELS[p])
     ]
-    lines = "\n".join(f"• {NAMES[p]}: <code>{html.escape(s['model_' + p])}</code>" for p in NAMES)
+    lines = "\n".join(f"• {NAMES[p]}: <code>{esc(s['model_' + p])}</code>" for p in NAMES)
     text = f"<b>🧩 Model AI</b>\n\n{lines}\n\nModel gratis OpenRouter bisa berubah sewaktu-waktu."
     return text, chunk(btns) + back("ai")
 
@@ -744,7 +1195,7 @@ async def scr_aimdl(_=""):
 async def scr_aipers(_=""):
     s = await settings()
     btns = [B(f"{'✅ ' if s['persona'] == k else ''}{v[0]}", "set", f"persona|{k}") for k, v in PERSONAS.items()]
-    desc = "\n".join(f"• <b>{v[0]}</b>: {html.escape(v[1])}" for v in PERSONAS.values())
+    desc = "\n".join(f"• <b>{v[0]}</b>: {esc(v[1])}" for v in PERSONAS.values())
     text = f"<b>🎭 Persona</b>\n\n{desc}\n\n<i>Prompt kustom (jika diisi) menggantikan persona.</i>"
     return text, chunk(btns) + back("ai")
 
@@ -752,13 +1203,17 @@ async def scr_aipers(_=""):
 async def scr_aisty(_=""):
     s = await settings()
     btns = [B(f"{'✅ ' if s['style'] == k else ''}{v[0]}", "set", f"style|{k}") for k, v in STYLES.items()]
-    desc = "\n".join(f"• <b>{v[0]}</b>: {html.escape(v[1])}" for v in STYLES.values())
+    desc = "\n".join(f"• <b>{v[0]}</b>: {esc(v[1])}" for v in STYLES.values())
     return f"<b>✍️ Gaya Bahasa</b>\n\n{desc}", chunk(btns) + back("ai")
 
 
 async def scr_chat(_=""):
     s = await settings()
-    text = "<b>💬 Mode Chat</b>\n\n🟢 = aktif. Angka diubah dengan ➕ / ➖ atau preset."
+    text = (
+        "<b>💬 Mode Chat</b>\n\n"
+        "🟢 = aktif. Bawaan: <b>semua menfess dibalas</b>, berapa pun panjang teksnya.\n"
+        "Ketuk tombol angka untuk melihat penjelasannya."
+    )
     rows = [
         [B(f"{on(s['comment_on'])} Komentar", "tog", "comment_on"),
          B(f"{on(s['reply_on'])} Reply", "tog", "reply_on")],
@@ -768,8 +1223,8 @@ async def scr_chat(_=""):
         [B("⏱ Jeda Min", "num", "delay_min"), B("⏱ Jeda Max", "num", "delay_max")],
         [B("🔢 Batas/Jam", "num", "max_comment_hour"), B("🔢 Balasan/Thread", "num", "max_thread")],
         [B("🔢 Balasan/User/Hari", "num", "max_user_day"), B("📩 DM/Jam", "num", "dm_hour")],
-        [B("📏 Min. Panjang", "num", "min_len"), B("🔑 Filter Keyword", "kw")],
-        [B("👥 Kelola DM", "dm")],
+        [B("📏 Min. Panjang", "num", "min_len"), B("🕰 Umur Maks Post", "num", "max_age_min")],
+        [B("🔑 Filter Keyword", "kw"), B("👥 Kelola DM", "dm")],
     ]
     return text, rows + back()
 
@@ -779,7 +1234,7 @@ async def scr_num(key=""):
     s = await settings()
     text = (
         f"<b>🎚 {label}</b>\n\nNilai saat ini : <b>{s[key]}</b>\nRentang : {lo} – {hi}\n\n"
-        f"<i>{html.escape(HELP.get(key, ''))}</i>"
+        f"<i>{esc(HELP.get(key, ''))}</i>"
     )
     rows = [
         [B(f"➖ {step * 5}", "adj", f"{key}|{-step * 5}"), B(f"➕ {step * 5}", "adj", f"{key}|{step * 5}")],
@@ -794,8 +1249,8 @@ async def scr_kw(_=""):
     words = ", ".join(s["keywords"]) or "(kosong: semua menfess dibalas)"
     text = (
         "<b>🔑 Filter Keyword</b>\n\n"
-        "Menfess hanya dibalas jika memuat salah satu kata:\n"
-        f"<code>{html.escape(words)}</code>"
+        "Kalau diisi, menfess hanya dibalas jika memuat salah satu kata:\n"
+        f"<code>{esc(words)}</code>"
     )
     rows = [[B("✏️ Ubah Daftar", "in", "keyword"), B("🧹 Kosongkan", "kwclr")]]
     return text, rows + back("chat")
@@ -824,19 +1279,16 @@ async def scr_duser(uid=""):
 async def scr_stats(_=""):
     st = await stats()
     logs = await q("SELECT ts, level, text FROM logs ORDER BY id DESC LIMIT 8")
-    lines = [
-        f"[{time.strftime('%d/%m %H:%M', time.localtime(x_['ts']))}] {x_['level']}: {html.escape(x_['text'][:120])}"
-        for x_ in logs
-    ]
+    lines = [f"[{fmt_short(x_['ts'])}] {x_['level']}: {esc(x_['text'][:110])}" for x_ in logs]
     log_text = "\n".join(f"<code>{line}</code>" for line in lines) or "<i>Belum ada log.</i>"
     text = (
         "<b>📊 Statistik</b>\n\n"
-        f"💬 Komentar : <b>{st.get('comment', 0)}</b>\n"
+        f"💬 Komentar menfess : <b>{st.get('comment', 0)}</b>\n"
         f"↩️ Balasan reply : <b>{st.get('reply', 0)}</b>\n"
         f"📩 Balasan DM : <b>{st.get('dm', 0)}</b>\n"
         f"⏭ Dilewati : <b>{st.get('skipped', 0)}</b>\n"
         f"❌ Error : <b>{st.get('error', 0)}</b>\n\n"
-        f"<b>Log terakhir</b>\n{log_text}"
+        f"<b>Log terakhir (WIB)</b>\n{log_text}"
     )
     rows = [[B("🔄 Refresh", "stats"), B("🗑 Reset Statistik", "ask", "rstats")]]
     return text, rows + back()
@@ -847,16 +1299,20 @@ async def scr_sys(_=""):
     up = int(time.time() - STARTED)
     hours, minutes = divmod(up // 60, 60)
     size = os.path.getsize(DB_PATH) / 1024 if os.path.exists(DB_PATH) else 0
-    ub_line = f"🟢 Online ({html.escape(ub.me.first_name or '')})" if ub and ub.ready else "🔴 Offline"
+    ub_line = f"🟢 Online ({esc(ub.me.first_name or '')})" if ub and ub.ready else "🔴 Offline"
     text = (
         "<b>⚙️ Sistem</b>\n\n"
         f"🤖 Userbot : {ub_line}\n"
         f"🗄 Database : {size:.1f} KB\n"
         f"⏱ Uptime : {hours} jam {minutes} menit\n"
-        f"🔔 Notifikasi : {'aktif' if s['notify'] else 'nonaktif'}"
+        f"🕒 {fmt()}\n"
+        f"🔔 Laporan gagal : {'aktif' if s['notify'] else 'nonaktif'}\n"
+        f"✅ Notif tiap balasan : {'aktif' if s['notify_ok'] else 'nonaktif'}"
     )
     rows = [
-        [B(f"{on(s['notify'])} Notifikasi", "tog", "notify"), B("🧹 Hapus Log", "ask", "clogs")],
+        [B(f"{on(s['notify'])} Laporan gagal", "tog", "notify"),
+         B(f"{on(s['notify_ok'])} Notif balasan", "tog", "notify_ok")],
+        [B("🩺 Diagnostik", "diag"), B("🧹 Hapus Log", "ask", "clogs")],
         [B("🗑 Hapus Riwayat AI", "ask", "chist"), B("🔄 Refresh", "sys")],
         [B("🔁 Restart", "ask", "restart")],
     ]
@@ -897,7 +1353,7 @@ async def scr_ask(spec=""):
 INPUT_TEXT = {
     "channel": ("➕ Tambah Channel",
                 "Kirim username channel, contoh <code>@namachannel</code>.\n"
-                "Userbot harus sudah menjadi member discussion group-nya."),
+                "Userbot sebaiknya sudah join grup diskusinya."),
     "prompt": ("📝 Prompt Kustom", "Kirim instruksi kepribadian AI. Ini menggantikan persona bawaan."),
     "keyword": ("🔑 Filter Keyword", "Kirim kata dipisahkan koma. Kirim <code>-</code> untuk mengosongkan."),
     "white": ("✅ Whitelist DM", "Kirim user ID Telegram (angka)."),
@@ -925,10 +1381,11 @@ def input_screen(kind):
 
 
 SCREENS = {
-    "home": scr_home, "chan": scr_chan, "chanv": scr_chanv, "ai": scr_ai,
-    "aiord": scr_aiord, "aimdl": scr_aimdl, "aipers": scr_aipers, "aisty": scr_aisty,
-    "chat": scr_chat, "num": scr_num, "kw": scr_kw, "dm": scr_dm, "duser": scr_duser,
-    "stats": scr_stats, "sys": scr_sys, "sess": scr_sess,
+    "home": scr_home, "chan": scr_chan, "chanv": scr_chanv, "diag": scr_diag,
+    "ai": scr_ai, "aitest": scr_aitest, "aiord": scr_aiord, "aimdl": scr_aimdl,
+    "aipers": scr_aipers, "aisty": scr_aisty, "chat": scr_chat, "num": scr_num,
+    "kw": scr_kw, "dm": scr_dm, "duser": scr_duser, "stats": scr_stats,
+    "sys": scr_sys, "sess": scr_sess,
 }
 
 
@@ -964,7 +1421,7 @@ panel.callback_query.filter(F.from_user.id == OWNER_ID)
 async def show(text, rows, notice=None):
     """Edit satu pesan panel. Kalau belum ada atau sudah hilang, kirim yang baru."""
     if notice:
-        text = f"<i>{html.escape(notice)}</i>\n\n{text}"
+        text = f"<i>{esc(notice)}</i>\n\n{text}"
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     if PANEL["mid"]:
         try:
@@ -980,8 +1437,6 @@ async def show(text, rows, notice=None):
 
 
 async def show_cb(cq: CallbackQuery, text, rows, notice=None):
-    if cq.message:
-        PANEL["chat"], PANEL["mid"] = cq.message.chat.id, cq.message.message_id
     await cq.answer()
     await show(text, rows, notice)
 
@@ -995,7 +1450,7 @@ async def show_string(string, me, source):
     PENDING["string"] = string
     text = (
         "<b>🔑 Session siap</b>\n\n"
-        f"Akun : {html.escape(me.first_name or '-')} (lewat {source})\n\n"
+        f"Akun : {esc(me.first_name or '-')} (lewat {source})\n\n"
         "1. Tekan <b>⚡ Aktifkan sekarang</b> supaya bot langsung memakai session ini.\n"
         "2. Salin string di bawah ke secret <code>TG_STRING_SESSION</code> di GitHub.\n\n"
         f"<code>{string}</code>"
@@ -1026,18 +1481,19 @@ def restart():
 
 @panel.message(CommandStart())
 async def on_start(msg: Message, state: FSMContext):
-    # /start TIDAK dihapus. Panel lama dihapus, panel baru dikirim di bawah /start.
+    # /start TIDAK dihapus. Panel lama dihapus, panel baru dikirim tepat di bawahnya.
     await state.clear()
     await drop_panel()
     text, rows = await render("home")
     await show(text, rows)
 
 
-@panel.callback_query(CB.filter())
-async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
+async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
     await state.clear()
-    a, b = callback_data.a, callback_data.b
+    a, b = cd.a, cd.b
     to, arg, notice = a, b, None
+    if cq.message:
+        PANEL["chat"], PANEL["mid"] = cq.message.chat.id, cq.message.message_id
 
     if a == "in":
         await state.set_state(INPUTS[b])
@@ -1046,18 +1502,23 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     if a == "ask":
         text, rows = await scr_ask(b)
         return await show_cb(cq, text, rows)
+    if a in ("diag", "aitest"):
+        await cq.answer("Memeriksa, tunggu sebentar...")
+        text, rows = await render(a, b)
+        return await show(text, rows)
     if a == "act":
         string = PENDING.get("string")
         if not string:
             text, rows = await render("sess")
             return await show_cb(cq, text, rows, "Session sudah tidak tersedia. Buat ulang.")
+        await cq.answer("Mengaktifkan...")
         ok, err = await activate(string)
         if ok:
             PENDING.clear()
             text, rows = await render("home")
-            return await show_cb(cq, text, rows, "✅ Userbot aktif dengan session baru.")
+            return await show(text, rows, "✅ Userbot aktif dengan session baru.")
         text, rows = await render("sess")
-        return await show_cb(cq, text, rows, f"Gagal mengaktifkan: {err}")
+        return await show(text, rows, f"Gagal mengaktifkan: {err}")
     if a == "loginx":
         await login_close()
         text, rows = await render("sess")
@@ -1065,7 +1526,7 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     if a == "tog":
         s = await settings()
         await setv(b, not s[b])
-        to, arg = ("sys" if b == "notify" else "chat"), ""
+        to, arg = ("sys" if b in ("notify", "notify_ok") else "chat"), ""
     elif a == "set":
         key, val = b.split("|", 1)
         if key == "order":
@@ -1135,11 +1596,24 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     await show_cb(cq, text, rows, notice)
 
 
+@panel.callback_query(CB.filter())
+async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
+    try:
+        await handle_cb(cq, callback_data, state)
+    except Exception as e:
+        log.exception("callback")
+        try:
+            await cq.answer(f"Error: {short(e)}"[:190], show_alert=True)
+        except Exception:
+            pass
+
+
 @panel.message(In.channel)
 async def in_channel(msg: Message, state: FSMContext):
     await state.clear()
     await delete_msg(msg)
-    name = (msg.text or "").strip().lstrip("@").lower()
+    raw = (msg.text or "").strip()
+    name = re.sub(r"^(https?://)?(t\.me/)?", "", raw).lstrip("@").split("/")[0].split("?")[0].lower()
     if not ub or not ub.ready:
         notice = "Userbot belum online. Buat session dulu di menu 🔑 Session."
     elif not name:
@@ -1152,9 +1626,9 @@ async def in_channel(msg: Message, state: FSMContext):
                 (info["username"], info["chat_id"], info["disc_id"], info["title"]),
             )
             await ub.refresh()
-            notice = f"@{name} berhasil ditambahkan."
+            notice = f"@{name} berhasil ditambahkan. Postingan baru akan dibalas otomatis."
         except Exception as e:
-            notice = f"Gagal: {e}"
+            notice = f"Gagal: {explain(e)}"
     text, rows = await render("chan")
     await show(text, rows, notice)
 
@@ -1234,7 +1708,7 @@ async def in_sessfile(msg: Message, state: FSMContext):
         string = session_to_string(base)
         me = await verify_string(string)
     except Exception as e:
-        return await show_result(f"Gagal memproses session: {e}")
+        return await show_result(f"Gagal memproses session: {short(e)}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     await show_string(string, me, "upload")
@@ -1254,7 +1728,7 @@ async def in_phone(msg: Message, state: FSMContext):
         sent = await c.send_code_request(phone)
     except Exception as e:
         await state.clear()
-        return await show_result(f"Gagal mengirim kode: {e}")
+        return await show_result(f"Gagal mengirim kode: {short(e)}")
     LOGIN.update(client=c, phone=phone, hash=sent.phone_code_hash)
     await state.set_state(In.code)
     text, rows = input_screen("code")
@@ -1272,17 +1746,17 @@ async def in_code(msg: Message, state: FSMContext):
         return await show_result("Sesi login tidak ditemukan. Mulai lagi dari menu Session.")
     try:
         await c.sign_in(phone=LOGIN["phone"], code=code, phone_code_hash=LOGIN["hash"])
-    except SessionPasswordNeededError:
+    except errors.SessionPasswordNeededError:
         await state.set_state(In.pwd)
         text, rows = input_screen("pwd")
         return await show(text, rows, "Akun ini memakai 2FA. Kirim password-nya.")
-    except PhoneCodeInvalidError:
+    except errors.PhoneCodeInvalidError:
         text, rows = input_screen("code")
         return await show(text, rows, "Kode salah. Coba lagi.")
     except Exception as e:
         await state.clear()
         await login_close()
-        return await show_result(f"Login gagal: {e}")
+        return await show_result(f"Login gagal: {short(e)}")
     await state.clear()
     string = c.session.save()
     me = await c.get_me()
@@ -1321,22 +1795,52 @@ async def on_any(msg: Message, state: FSMContext):
 
 # ---------- entry point ----------
 
+async def startup_check():
+    """Periksa semua channel saat bot menyala dan laporkan masalahnya ke owner."""
+    try:
+        chans = await q("SELECT * FROM channels")
+        problems = []
+        for ch in chans:
+            lines = await ub.diagnose(ch)
+            bad = [ln for ln in lines if ln.startswith(("❌", "⚠️"))]
+            if bad:
+                problems.append(f"<b>@{esc(ch['username'])}</b>\n" + "\n".join(bad))
+        if problems:
+            await notify("🩺 <b>Cek awal menemukan masalah</b>\n🕒 " + fmt() + "\n\n" + "\n\n".join(problems))
+        elif chans:
+            await notify(f"🩺 Cek awal: {len(chans)} channel siap, semua pemeriksaan lolos.\n🕒 {fmt()}")
+        else:
+            await notify("ℹ️ Belum ada channel. Tambahkan lewat panel: Channel → Tambah Channel.")
+    except Exception as e:
+        log.warning("startup_check gagal: %s", e)
+
+
 async def run_bot():
     global bot, ub
     await db_init()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     s = await settings()
-    # Session dari panel (jika pernah diaktifkan) didahulukan, lalu secret TG_STRING_SESSION.
     ub = UB(s.get("session") or SESSION)
+    err = ""
     try:
         await ub.start()
     except Exception as e:
-        log.error("Userbot gagal: %s", e)
-        await log_("ERROR", f"Userbot gagal: {e}")
+        err = short(e)
+        log.error("Userbot gagal: %s", err)
+        await log_("ERROR", f"Userbot gagal: {err}")
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(panel)
-    await notify("✅ Bot aktif." if ub.ready else "⚠️ Panel aktif. Userbot offline, buat session di menu 🔑 Session.")
+    if ub.ready:
+        await notify(f"✅ <b>Bot dan userbot aktif</b>\n🕒 {fmt()}\n👤 {esc(ub.me.first_name or '-')}")
+        task = asyncio.create_task(startup_check())
+        BG.add(task)
+        task.add_done_callback(BG.discard)
+    else:
+        await notify(
+            f"⚠️ <b>Panel aktif, userbot OFFLINE</b>\n🕒 {fmt()}\n❓ {esc(err)}\n"
+            "💡 Buat session di menu 🔑 Session, atau periksa secret TG_STRING_SESSION."
+        )
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
