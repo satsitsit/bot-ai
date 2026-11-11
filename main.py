@@ -1,6 +1,6 @@
 """
-Menfess AI Bot: panel inline (aiogram) + userbot (Telethon) dalam satu proses.
-Session bisa dibuat langsung dari menu 🔑 Session di panel.
+Menfess AI Bot: panel inline (aiogram) + userbot (Telethon) dalam satu file.
+Jalankan bot: python main.py
 """
 import asyncio
 import html
@@ -37,7 +37,7 @@ from telethon.tl.types import Channel, PeerChannel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
-# ---------- konfigurasi (dari environment / GitHub Secrets) ----------
+# ---------- konfigurasi (dari GitHub Secrets) ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 API_ID = int(os.getenv("API_ID") or 0)
@@ -54,9 +54,9 @@ URLS = {
     "groq": "https://api.groq.com/openai/v1/chat/completions",
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
 }
-# Nama model bisa berubah. Sesuaikan jika ada error HTTP 404.
+# Nama model bisa berubah. Kalau ada error HTTP 404, ganti di sini.
 MODELS = {
-    "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+    "gemini": ["gemini-flash-latest", "gemini-2.5-flash-lite"],
     "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
     "openrouter": ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-3-27b-it:free"],
 }
@@ -69,28 +69,47 @@ STYLES = {
     "baku": ("Baku", "Gunakan bahasa Indonesia baku dan sopan."),
     "santai": ("Santai", "Gunakan bahasa Indonesia santai sehari-hari."),
     "gaul": ("Gaul", "Gunakan bahasa Indonesia gaul ringan tanpa kata kasar."),
+    "x": (
+        "X Santai",
+        "Gunakan gaya bahasa Indonesia santai seperti pengguna X/Twitter. "
+        "Huruf kecil semua. Singkat, natural, dan tidak kaku. Minim tanda baca. "
+        "Emoji maksimal satu dan tidak selalu digunakan. "
+        "Sesekali menggunakan bahasa sehari-hari seperti wkwk, relate, atau semangat ya. "
+        "Jangan berlebihan atau terdengar seperti robot.",
+    ),
 }
 # key: (label, min, max, langkah, preset)
 NUMS = {
-    "reply_prob": ("Probabilitas balas menfess (%)", 0, 100, 5, [25, 50, 75, 100]),
-    "thread_prob": ("Probabilitas balas reply (%)", 0, 100, 5, [30, 60, 80, 100]),
-    "min_len": ("Panjang minimal menfess (karakter)", 1, 200, 1, [1, 3, 10, 20]),
+    "reply_prob": ("Peluang balas menfess (%)", 0, 100, 5, [25, 50, 75, 100]),
+    "thread_prob": ("Peluang balas reply (%)", 0, 100, 5, [30, 60, 80, 100]),
+    "min_len": ("Panjang minimal menfess (karakter)", 0, 200, 1, [0, 1, 3, 10]),
     "delay_min": ("Jeda minimal (detik)", 0, 600, 5, [5, 15, 30]),
     "delay_max": ("Jeda maksimal (detik)", 0, 900, 5, [15, 30, 60, 120]),
-    "max_comment_hour": ("Komentar per jam", 1, 60, 1, [3, 6, 10, 20]),
+    "max_comment_hour": ("Batas komentar per jam", 1, 1000, 10, [6, 30, 100, 1000]),
     "max_thread": ("Balasan per thread", 1, 20, 1, [1, 2, 3, 5]),
     "max_user_day": ("Balasan per user per hari", 1, 100, 1, [3, 5, 10, 20]),
     "dm_hour": ("Balasan DM per jam", 1, 200, 5, [10, 20, 50, 100]),
 }
+HELP = {
+    "reply_prob": "Dari 100 menfess yang masuk, berapa yang dibalas. 100 berarti semua menfess dibalas.",
+    "thread_prob": "Peluang bot membalas orang yang membalas komentarnya. 70 berarti sekitar 7 dari 10.",
+    "min_len": "Menfess yang teksnya lebih pendek dari angka ini dilewati. 0 berarti semua dibalas.",
+    "delay_min": "Waktu tunggu minimal sebelum bot membalas, supaya terlihat manusiawi.",
+    "delay_max": "Waktu tunggu maksimal. Bot memilih acak antara jeda minimal dan maksimal.",
+    "max_comment_hour": "Batas komentar menfess per jam. Setelah tercapai, sisanya dilewati sampai jam berikutnya.",
+    "max_thread": "Berapa kali bot boleh membalas dalam satu thread (satu menfess).",
+    "max_user_day": "Berapa kali bot boleh membalas satu orang yang sama dalam sehari.",
+    "dm_hour": "Batas balasan DM per jam untuk setiap pengguna.",
+}
 DEFAULTS = {
     "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False, "notify": True,
-    "reply_prob": 60, "thread_prob": 70, "min_len": 3, "delay_min": 5, "delay_max": 25,
-    "max_comment_hour": 6, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
+    "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 5, "delay_max": 25,
+    "max_comment_hour": 1000, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
     "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": [],
     "model_gemini": MODELS["gemini"][0],
     "model_groq": MODELS["groq"][0],
     "model_openrouter": MODELS["openrouter"][0],
-    "persona": "teman", "style": "santai", "prompt": "",
+    "persona": "teman", "style": "x", "prompt": "",
 }
 DISCLOSURE = (
     "Halo! 👋 Akun ini menggunakan asisten AI untuk membalas pesan secara otomatis.\n"
@@ -117,7 +136,8 @@ STARTED = time.time()
 bot = None
 ub = None
 db = None
-LOGIN = {}  # state login OTP yang sedang berjalan
+LOGIN = {}    # client login OTP yang sedang berjalan
+PENDING = {}  # session string yang menunggu diaktifkan
 
 
 class AIError(Exception):
@@ -221,12 +241,12 @@ def system_prompt(s, mode):
     return (
         f"{persona}\n{STYLES[s['style']][1]}\n{MODE_TEXT[mode]}\n\n"
         "Aturan wajib:\n"
-        "- Balas dalam Bahasa Indonesia, singkat (1-3 kalimat), seperti chat sungguhan.\n"
+        "- Balas dalam Bahasa Indonesia, singkat, seperti chat sungguhan.\n"
         "- Jika ditanya, jujur bahwa kamu asisten AI. Jangan mengaku manusia.\n"
         "- Jangan menghina, memprovokasi, membahas SARA, pornografi, atau kekerasan.\n"
         "- Jangan meminta atau membagikan data pribadi.\n"
         "- Jangan memaksakan percakapan. Tutup dengan sopan jika sudah cukup.\n"
-        "- Jika pesan spam, provokasi, tidak bermakna, atau sebaiknya tidak dibalas, jawab persis: SKIP\n"
+        "- Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP\n"
         "- Keluarkan hanya teks balasan."
     )
 
@@ -262,7 +282,7 @@ async def call(http, name, model, system, msgs):
 
 
 async def ask_ai(mode, msgs, s):
-    """Coba provider sesuai urutan. Jika semua gagal, raise AIError."""
+    """Coba provider sesuai urutan. Kalau semua gagal, raise AIError."""
     system = system_prompt(s, mode)
     errs = []
     async with httpx.AsyncClient(timeout=30) as http:
@@ -308,8 +328,8 @@ async def find_root(m):
 
 
 class UB:
-    def __init__(self):
-        self.c = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+    def __init__(self, string):
+        self.c = TelegramClient(StringSession(string or ""), API_ID, API_HASH)
         self.me = None
         self.ready = False
         self.by_disc = {}
@@ -320,7 +340,7 @@ class UB:
     async def start(self):
         await self.c.connect()
         if not await self.c.is_user_authorized():
-            raise RuntimeError("TG_STRING_SESSION kosong atau tidak valid")
+            raise RuntimeError("session kosong atau tidak valid")
         self.me = await self.c.get_me()
         self.c.add_event_handler(self.on_in, events.NewMessage(incoming=True))
         self.c.add_event_handler(self.on_out, events.NewMessage(outgoing=True))
@@ -351,7 +371,7 @@ class UB:
             "title": ent.title,
         }
 
-    # setiap event diproses di task terpisah agar delay tidak memblokir update lain
+    # setiap event diproses di task sendiri agar delay tidak memblokir update lain
     def spawn(self, coro):
         t = asyncio.create_task(self.guard(coro))
         self.tasks.add(t)
@@ -382,7 +402,7 @@ class UB:
             self.spawn(self.takeover(ev))
 
     async def say(self, chat, text, reply_to=None):
-        # Catat waktu sebelum kirim, supaya event pesan keluar ini tidak dianggap takeover.
+        # Catat waktu sebelum kirim, supaya pesan ini tidak dianggap takeover.
         self.ai_at[chat] = time.time()
         await self.c.send_message(chat, text, reply_to=reply_to)
 
@@ -391,16 +411,16 @@ class UB:
             await asyncio.sleep(min(1.5 + len(text) * 0.05, 8))
         await self.say(chat, text, reply_to)
 
-    # A. komentar menfess / B. balas reply
+    # A. komentar menfess, B. balas reply
     async def group(self, ev):
         ch = self.by_disc[ev.chat_id]
         msg = ev.message
         s = await settings()
         fwd = msg.fwd_from
-        is_post = msg.sender_id == ch["chat_id"] or (
+        from_channel = bool(
             fwd and fwd.channel_post and fwd.from_id and utils.get_peer_id(fwd.from_id) == ch["chat_id"]
         )
-        if is_post:
+        if from_channel:
             return await self.menfess(msg, ch, s)
         if msg.reply_to_msg_id and msg.sender_id != self.me.id:
             return await self.reply(msg, s)
@@ -411,8 +431,8 @@ class UB:
         text = (msg.message or "").strip()
         if len(text) < s["min_len"]:
             return await skip(f"menfess terlalu pendek ({len(text)} karakter)")
-        if random.uniform(0, 100) > s["reply_prob"]:
-            return await skip("kena probabilitas")
+        if s["reply_prob"] < 100 and random.uniform(0, 100) > s["reply_prob"]:
+            return await skip("kena peluang balas")
         if s["keywords"] and not any(k.lower() in text.lower() for k in s["keywords"]):
             return await skip("tidak ada keyword yang cocok")
         hk = f"hour:{datetime.now():%Y%m%d%H}:c"
@@ -421,7 +441,9 @@ class UB:
 
         await log_("INFO", f"Menfess #{msg.id} diproses")
         await humanize(s)
-        prompt = f'Menfess:\n"""\n{text[:800]}\n"""\nTulis satu komentar singkat.'
+        # Menfess foto/video tanpa teks tetap dibalas, dengan konteks umum.
+        content = text[:800] or "(menfess ini berupa foto atau video tanpa teks)"
+        prompt = f'Menfess:\n"""\n{content}\n"""\nTulis satu komentar singkat.'
         reply = await ask_ai("menfess", [{"role": "user", "content": prompt}], s)
         if is_skip(reply):
             return await skip("AI memilih SKIP")
@@ -441,7 +463,7 @@ class UB:
             return await skip("reply bukan ke thread menfess")
         uid = msg.sender_id
         if (await user(uid))["lst"] == "black":
-            return await skip("pengirim di blacklist")
+            return await skip("pengirim ada di blacklist")
         text = (msg.message or "").strip()
         if len(text) < 2:
             return await skip("reply terlalu pendek")
@@ -458,7 +480,7 @@ class UB:
         if await count(day) >= s["max_user_day"]:
             return await skip("batas balasan per user tercapai")
         if random.uniform(0, 100) > s["thread_prob"]:
-            return await skip("reply kena probabilitas")
+            return await skip("kena peluang balas reply")
 
         sender = await msg.get_sender()
         name = getattr(sender, "first_name", None) or "Seseorang"
@@ -515,7 +537,7 @@ class UB:
         await stat("dm")
 
     async def takeover(self, ev):
-        """Jika owner mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
+        """Jika kamu mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
         uid = ev.chat_id
         if time.time() - self.ai_at.get(uid, 0) < 10:
             return
@@ -526,11 +548,11 @@ class UB:
             await notify(f"🙋 Kamu mengambil alih chat {uid}. AI dimatikan untuk user ini.")
 
 
-# ---------- session: konversi, verifikasi, login OTP ----------
+# ---------- session: konversi, verifikasi, aktivasi ----------
 
-def session_to_string(path):
+def session_to_string(path_no_ext):
     """Ubah file .session (SQLite Telethon) menjadi StringSession."""
-    old = SQLiteSession(path)
+    old = SQLiteSession(path_no_ext)
     try:
         if old.auth_key is None:
             raise ValueError("file session kosong atau tidak valid")
@@ -553,6 +575,28 @@ async def verify_string(string):
         await c.disconnect()
 
 
+async def activate(string):
+    """Mulai userbot baru dengan session ini, lalu simpan ke database."""
+    global ub
+    new = UB(string)
+    try:
+        await new.start()
+    except Exception as e:
+        try:
+            await new.stop()
+        except Exception:
+            pass
+        return False, str(e)
+    old, ub = ub, new
+    if old:
+        try:
+            await old.stop()
+        except Exception:
+            pass
+    await setv("session", string)
+    return True, ""
+
+
 async def login_close():
     c = LOGIN.get("client")
     LOGIN.clear()
@@ -571,6 +615,7 @@ class CB(CallbackData, prefix="c"):
 
 
 def B(text, a, b=""):
+    # Data tombol memakai "|" sebagai pemisah di dalam b, bukan ":".
     return InlineKeyboardButton(text=text, callback_data=CB(a=a, b=b).pack())
 
 
@@ -653,7 +698,7 @@ async def scr_chanv(username=""):
     )
     rows = [[
         B("▶️ Lanjutkan" if c["paused"] else "⏸ Jeda", "pause", username),
-        B("🗑 Hapus", "ask", f"delchan:{username}"),
+        B("🗑 Hapus", "ask", f"delchan|{username}"),
     ]]
     return text, rows + back("chan")
 
@@ -678,16 +723,17 @@ async def scr_ai(_=""):
 
 async def scr_aiord(_=""):
     s = await settings()
-    presets = [[B(" → ".join(NAMES[p] for p in perm), "set", f"order:{','.join(perm)}")]
+    presets = [[B(" → ".join(NAMES[p] for p in perm), "set", f"order|{','.join(perm)}")]
                for perm in permutations(NAMES)]
     toggles = [B(f"{'⛔' if p in s['disabled'] else '✅'} {NAMES[p]}", "prov", p) for p in NAMES]
-    return "<b>🔀 Urutan Provider</b>\n\nFallback mengikuti urutan ini.", presets + chunk(toggles) + back("ai")
+    text = "<b>🔀 Urutan Provider</b>\n\nJika satu provider gagal, sistem mencoba provider berikutnya."
+    return text, presets + chunk(toggles) + back("ai")
 
 
 async def scr_aimdl(_=""):
     s = await settings()
     btns = [
-        B(f"{'✅ ' if s['model_' + p] == m else ''}{NAMES[p]} · {m.split('/')[-1][:22]}", "mdl", f"{p}:{i}")
+        B(f"{'✅ ' if s['model_' + p] == m else ''}{NAMES[p]} · {m.split('/')[-1][:22]}", "mdl", f"{p}|{i}")
         for p in NAMES for i, m in enumerate(MODELS[p])
     ]
     lines = "\n".join(f"• {NAMES[p]}: <code>{html.escape(s['model_' + p])}</code>" for p in NAMES)
@@ -697,7 +743,7 @@ async def scr_aimdl(_=""):
 
 async def scr_aipers(_=""):
     s = await settings()
-    btns = [B(f"{'✅ ' if s['persona'] == k else ''}{v[0]}", "set", f"persona:{k}") for k, v in PERSONAS.items()]
+    btns = [B(f"{'✅ ' if s['persona'] == k else ''}{v[0]}", "set", f"persona|{k}") for k, v in PERSONAS.items()]
     desc = "\n".join(f"• <b>{v[0]}</b>: {html.escape(v[1])}" for v in PERSONAS.values())
     text = f"<b>🎭 Persona</b>\n\n{desc}\n\n<i>Prompt kustom (jika diisi) menggantikan persona.</i>"
     return text, chunk(btns) + back("ai")
@@ -705,7 +751,7 @@ async def scr_aipers(_=""):
 
 async def scr_aisty(_=""):
     s = await settings()
-    btns = [B(f"{'✅ ' if s['style'] == k else ''}{v[0]}", "set", f"style:{k}") for k, v in STYLES.items()]
+    btns = [B(f"{'✅ ' if s['style'] == k else ''}{v[0]}", "set", f"style|{k}") for k, v in STYLES.items()]
     desc = "\n".join(f"• <b>{v[0]}</b>: {html.escape(v[1])}" for v in STYLES.values())
     return f"<b>✍️ Gaya Bahasa</b>\n\n{desc}", chunk(btns) + back("ai")
 
@@ -718,9 +764,9 @@ async def scr_chat(_=""):
          B(f"{on(s['reply_on'])} Reply", "tog", "reply_on")],
         [B(f"{on(s['dm_on'])} DM", "tog", "dm_on"),
          B(f"{on(s['dm_whitelist'])} DM Whitelist saja", "tog", "dm_whitelist")],
-        [B("🎚 Prob. Menfess", "num", "reply_prob"), B("🎚 Prob. Reply", "num", "thread_prob")],
+        [B("🎚 Peluang Menfess", "num", "reply_prob"), B("🎚 Peluang Reply", "num", "thread_prob")],
         [B("⏱ Jeda Min", "num", "delay_min"), B("⏱ Jeda Max", "num", "delay_max")],
-        [B("🔢 Komentar/Jam", "num", "max_comment_hour"), B("🔢 Balasan/Thread", "num", "max_thread")],
+        [B("🔢 Batas/Jam", "num", "max_comment_hour"), B("🔢 Balasan/Thread", "num", "max_thread")],
         [B("🔢 Balasan/User/Hari", "num", "max_user_day"), B("📩 DM/Jam", "num", "dm_hour")],
         [B("📏 Min. Panjang", "num", "min_len"), B("🔑 Filter Keyword", "kw")],
         [B("👥 Kelola DM", "dm")],
@@ -731,12 +777,15 @@ async def scr_chat(_=""):
 async def scr_num(key=""):
     label, lo, hi, step, presets = NUMS[key]
     s = await settings()
-    text = f"<b>🎚 {label}</b>\n\nNilai saat ini : <b>{s[key]}</b>\nRentang : {lo} – {hi}"
+    text = (
+        f"<b>🎚 {label}</b>\n\nNilai saat ini : <b>{s[key]}</b>\nRentang : {lo} – {hi}\n\n"
+        f"<i>{html.escape(HELP.get(key, ''))}</i>"
+    )
     rows = [
-        [B(f"➖ {step * 5}", "adj", f"{key}:{-step * 5}"), B(f"➕ {step * 5}", "adj", f"{key}:{step * 5}")],
-        [B(f"➖ {step}", "adj", f"{key}:{-step}"), B(f"➕ {step}", "adj", f"{key}:{step}")],
+        [B(f"➖ {step * 5}", "adj", f"{key}|{-step * 5}"), B(f"➕ {step * 5}", "adj", f"{key}|{step * 5}")],
+        [B(f"➖ {step}", "adj", f"{key}|{-step}"), B(f"➕ {step}", "adj", f"{key}|{step}")],
     ]
-    rows += chunk([B(f"⭐ {p}", "set", f"{key}:{p}") for p in presets])
+    rows += chunk([B(f"⭐ {p}", "set", f"{key}|{p}") for p in presets])
     return text, rows + back("chat")
 
 
@@ -766,8 +815,8 @@ async def scr_duser(uid=""):
     text = f"<b>👤 Pengguna {uid}</b>\n\nStatus : {user_tag(u)}\nAI : {ai_state}\nBalasan : {stop_state}"
     rows = [
         [B("🔁 Aktifkan AI" if not u["ai_on"] else "⛔ Matikan AI", "aitog", uid)],
-        [B("✅ Whitelist", "list", f"{uid}:white"), B("🚫 Blacklist", "list", f"{uid}:black")],
-        [B("♻️ Hapus dari list", "list", f"{uid}:none")],
+        [B("✅ Whitelist", "list", f"{uid}|white"), B("🚫 Blacklist", "list", f"{uid}|black")],
+        [B("♻️ Hapus dari list", "list", f"{uid}|none")],
     ]
     return text, rows + back("dm")
 
@@ -819,8 +868,7 @@ async def scr_sess(_=""):
     text = (
         "<b>🔑 Session Userbot</b>\n\n"
         f"Status : {'🟢 Userbot login' if online else '🔴 Userbot belum login'}\n\n"
-        "Buat session baru, lalu salin string-nya ke secret <code>TG_STRING_SESSION</code>.\n"
-        "• <b>Upload</b>: pakai file <code>.session</code> dari PC.\n"
+        "• <b>Upload</b>: file <code>.session</code> atau <code>.zip</code> dari PC.\n"
         "• <b>Login OTP</b>: masuk langsung lewat kode dari Telegram."
     )
     rows = [
@@ -840,7 +888,7 @@ ASK = {
 
 
 async def scr_ask(spec=""):
-    action = spec.split(":", 1)[0]
+    action = spec.split("|", 1)[0]
     question, back_to = ASK[action]
     rows = [[B("✅ Ya, lanjutkan", "ok", spec)]] + back(back_to)
     return f"<b>⚠️ Konfirmasi</b>\n\n{question}", rows
@@ -914,7 +962,7 @@ panel.callback_query.filter(F.from_user.id == OWNER_ID)
 
 
 async def show(text, rows, notice=None):
-    """Edit satu pesan panel. Jika belum ada atau sudah hilang, kirim yang baru di bawah."""
+    """Edit satu pesan panel. Kalau belum ada atau sudah hilang, kirim yang baru."""
     if notice:
         text = f"<i>{html.escape(notice)}</i>\n\n{text}"
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -944,16 +992,16 @@ async def show_result(notice):
 
 
 async def show_string(string, me, source):
+    PENDING["string"] = string
     text = (
         "<b>🔑 Session siap</b>\n\n"
-        f"Akun : {html.escape(me.first_name or '-')} (dari {source})\n\n"
-        "1. Salin string di bawah.\n"
-        "2. Simpan sebagai secret <code>TG_STRING_SESSION</code> di GitHub.\n"
-        "3. Jalankan ulang workflow.\n"
-        "4. Tekan Beranda agar string ini hilang dari layar.\n\n"
+        f"Akun : {html.escape(me.first_name or '-')} (lewat {source})\n\n"
+        "1. Tekan <b>⚡ Aktifkan sekarang</b> supaya bot langsung memakai session ini.\n"
+        "2. Salin string di bawah ke secret <code>TG_STRING_SESSION</code> di GitHub.\n\n"
         f"<code>{string}</code>"
     )
-    await show(text, back("sess"))
+    rows = [[B("⚡ Aktifkan sekarang", "act")]] + back("sess")
+    await show(text, rows)
 
 
 async def delete_msg(msg: Message):
@@ -989,8 +1037,7 @@ async def on_start(msg: Message, state: FSMContext):
 async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     await state.clear()
     a, b = callback_data.a, callback_data.b
-    notice = None
-    to, arg = a, b
+    to, arg, notice = a, b, None
 
     if a == "in":
         await state.set_state(INPUTS[b])
@@ -999,6 +1046,18 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     if a == "ask":
         text, rows = await scr_ask(b)
         return await show_cb(cq, text, rows)
+    if a == "act":
+        string = PENDING.get("string")
+        if not string:
+            text, rows = await render("sess")
+            return await show_cb(cq, text, rows, "Session sudah tidak tersedia. Buat ulang.")
+        ok, err = await activate(string)
+        if ok:
+            PENDING.clear()
+            text, rows = await render("home")
+            return await show_cb(cq, text, rows, "✅ Userbot aktif dengan session baru.")
+        text, rows = await render("sess")
+        return await show_cb(cq, text, rows, f"Gagal mengaktifkan: {err}")
     if a == "loginx":
         await login_close()
         text, rows = await render("sess")
@@ -1008,21 +1067,22 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
         await setv(b, not s[b])
         to, arg = ("sys" if b == "notify" else "chat"), ""
     elif a == "set":
-        key, val = b.split(":", 1)
+        key, val = b.split("|", 1)
         if key == "order":
             await setv("order", val.split(","))
+            to, arg = "aiord", ""
         elif key in ("persona", "style"):
             await setv(key, val)
+            to, arg = ("aipers" if key == "persona" else "aisty"), ""
         else:
             await setv(key, int(val))
-        to = {"order": "aiord", "persona": "aipers", "style": "aisty"}.get(key, "num")
-        arg = "" if key in ("order", "persona", "style") else key
+            to, arg = "num", key
     elif a == "mdl":
-        prov, idx = b.split(":")
+        prov, idx = b.split("|")
         await setv(f"model_{prov}", MODELS[prov][int(idx)])
         to, arg = "aimdl", ""
     elif a == "adj":
-        key, delta = b.split(":")
+        key, delta = b.split("|")
         _, lo, hi, _, _ = NUMS[key]
         s = await settings()
         await setv(key, max(lo, min(hi, s[key] + int(delta))))
@@ -1033,7 +1093,8 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
         to, arg = "aiord", ""
     elif a == "pause":
         await x("UPDATE channels SET paused = 1 - paused WHERE username=?", (b,))
-        await ub.refresh()
+        if ub:
+            await ub.refresh()
         to, arg = "chanv", b
     elif a == "rprompt":
         await setv("prompt", "")
@@ -1046,15 +1107,16 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
         await user_set(int(b), ai_on=0 if u["ai_on"] else 1)
         to, arg = "duser", b
     elif a == "list":
-        uid, lst = b.split(":")
+        uid, lst = b.split("|")
         await user_set(int(uid), lst=None if lst == "none" else lst)
         to, arg = "duser", uid
     elif a == "ok":
-        action, target = b.split(":", 1) if ":" in b else (b, "")
+        action, _, target = b.partition("|")
         to, arg = "home", ""
         if action == "delchan":
             await x("DELETE FROM channels WHERE username=?", (target,))
-            await ub.refresh()
+            if ub:
+                await ub.refresh()
             to = "chan"
         elif action == "rstats":
             await x("DELETE FROM counters WHERE key LIKE 'stat:%'")
@@ -1166,10 +1228,10 @@ async def in_sessfile(msg: Message, state: FSMContext):
         else:
             with open(raw, "rb") as f:
                 data = f.read()
-        path = os.path.join(tmp, "account.session")
-        with open(path, "wb") as f:
+        base = os.path.join(tmp, "account")
+        with open(base + ".session", "wb") as f:
             f.write(data)
-        string = session_to_string(path)
+        string = session_to_string(base)
         me = await verify_string(string)
     except Exception as e:
         return await show_result(f"Gagal memproses session: {e}")
@@ -1192,11 +1254,11 @@ async def in_phone(msg: Message, state: FSMContext):
         sent = await c.send_code_request(phone)
     except Exception as e:
         await state.clear()
-        return await show_result(f"Gagal kirim kode: {e}")
+        return await show_result(f"Gagal mengirim kode: {e}")
     LOGIN.update(client=c, phone=phone, hash=sent.phone_code_hash)
     await state.set_state(In.code)
     text, rows = input_screen("code")
-    await show(text, rows, "Kode OTP dikirim ke akun Telegram tersebut.")
+    await show(text, rows, "Kode OTP sudah dikirim ke akun Telegram tersebut.")
 
 
 @panel.message(In.code)
@@ -1224,8 +1286,7 @@ async def in_code(msg: Message, state: FSMContext):
     await state.clear()
     string = c.session.save()
     me = await c.get_me()
-    await c.disconnect()
-    LOGIN.clear()
+    await login_close()
     await show_string(string, me, "login OTP")
 
 
@@ -1246,8 +1307,7 @@ async def in_pwd(msg: Message, state: FSMContext):
     await state.clear()
     string = c.session.save()
     me = await c.get_me()
-    await c.disconnect()
-    LOGIN.clear()
+    await login_close()
     await show_string(string, me, "login OTP")
 
 
@@ -1259,13 +1319,15 @@ async def on_any(msg: Message, state: FSMContext):
     await show(text, rows)
 
 
-# ---------- entry points ----------
+# ---------- entry point ----------
 
 async def run_bot():
     global bot, ub
     await db_init()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    ub = UB()
+    s = await settings()
+    # Session dari panel (jika pernah diaktifkan) didahulukan, lalu secret TG_STRING_SESSION.
+    ub = UB(s.get("session") or SESSION)
     try:
         await ub.start()
     except Exception as e:
