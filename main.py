@@ -314,6 +314,32 @@ async def incr(key):
     await x("INSERT INTO counters(key, value) VALUES(?, 1) ON CONFLICT(key) DO UPDATE SET value=value+1", (key,))
 
 
+async def claim(chat_id, post_id):
+    """Tandai postingan sebagai sedang ditangani. True kalau baru, False kalau sudah diklaim jalur lain
+    (realtime, cek berkala, atau grup diskusi), supaya satu postingan tidak dibalas dua kali."""
+    async with DB_LOCK:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO seen(chat_id, post_id) VALUES(?, ?)", (int(chat_id), int(post_id))
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def cursor_get(chat_id):
+    """ID postingan terakhir yang sudah diproses untuk channel ini, atau None kalau belum ada."""
+    rows = await q("SELECT last_id FROM cursor WHERE chat_id=?", (int(chat_id),))
+    return int(rows[0]["last_id"]) if rows else None
+
+
+async def cursor_bump(chat_id, last_id):
+    """Majukan cursor channel; tidak pernah mundur."""
+    await x(
+        "INSERT INTO cursor(chat_id, last_id) VALUES(?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
+        (int(chat_id), int(last_id)),
+    )
+
+
 async def stat(name):
     await incr(f"stat:{name}")
 
@@ -2172,6 +2198,11 @@ class UB:
                     or (s["dm_whitelist"] and u["lst"] != "white")):
                 await self.finish_dm_queue(chat_id, msg_id, "DM nonaktif/blacklist/opt-out/di luar whitelist")
                 return
+            hk = f"dm:{uid}:{now_wib():%Y%m%d%H}"
+            if s["dm_hour"] > 0 and await count(hk) >= s["dm_hour"]:
+                await skip(f"DM {uid}: batas balasan per jam tercapai")
+                await self.finish_dm_queue(chat_id, msg_id, "batas DM per jam tercapai")
+                return
             if not u["greeted"]:
                 await self.say(uid, DISCLOSURE, peer)
                 await user_set(uid, greeted=1)
@@ -2229,6 +2260,7 @@ class UB:
                     (chat_id, msg_id),
                 )
                 await db.commit()
+            await incr(hk)
             await stat("dm")
 
 
