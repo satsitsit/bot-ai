@@ -9,6 +9,7 @@ Alur utama:
 import asyncio
 import base64
 import gzip
+import heapq
 import html
 import io
 import json
@@ -62,11 +63,13 @@ URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
 }
 # Nama model bisa berubah. Kalau Tes AI menampilkan 404, ganti di sini atau pilih model lain di panel.
-# Update 11/11/2026: llama-3.x (Groq) pensiun 16 Agu 2026, gemini-2.5-* pensiun 16 Okt 2026.
+# Model ID di bawah dipilih dari katalog provider yang masih aktif; alias dinamis dihindari kecuali router OpenRouter.
 MODELS = {
-    "gemini": ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest"],
-    "groq": ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.6-27b"],
-    "openrouter": ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-3-27b-it:free"],
+    # Model ID diperbarui mengikuti katalog resmi provider (Nov 2026).
+    "gemini": ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"],
+    "groq": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+    # Router ini memilih model gratis yang tersedia; model gratis tetap memiliki rate limit.
+    "openrouter": ["openrouter/free"],
 }
 # panjang jawaban: key -> (label, aturan untuk AI, batas token, batas karakter)
 LENGTHS = {
@@ -105,21 +108,21 @@ NUMS = {
     "delay_max": ("Jeda balas paling lama (detik)", 0, 900, 5, [3, 10, 30, 60]),
     "max_comment_hour": ("Maks komentar menfess per jam (0 = bebas)", 0, 1000, 10, [0, 30, 100, 500]),
     "max_age_min": ("Abaikan postingan lebih tua dari (menit)", 5, 1440, 5, [15, 30, 60, 180]),
-    "max_thread": ("Maks balasan per thread", 1, 20, 1, [1, 2, 3, 5]),
-    "max_user_day": ("Maks balasan per orang per hari", 1, 100, 1, [3, 5, 10, 20]),
-    "dm_hour": ("Maks balasan DM per jam per orang (0 = bebas)", 0, 200, 5, [0, 10, 20, 50]),
+    "max_thread": ("Maks balasan per thread (0 = bebas)", 0, 1000, 1, [0, 20, 100, 1000]),
+    "max_user_day": ("Maks balasan per orang per hari (0 = bebas)", 0, 1000, 1, [0, 20, 100, 1000]),
+    "dm_hour": ("Maks balasan DM per jam per orang (0 = bebas)", 0, 1000, 5, [0, 50, 200, 1000]),
 }
 # profil cepat: sekali tekan mengatur banyak angka sekaligus
 PROFILES = {
     "hemat": ("🐢 Hemat Kuota", "Aman untuk AI gratis. Tidak semua dibalas, ada jeda, dan ada batas per jam.",
               dict(reply_prob=60, thread_prob=50, delay_min=3, delay_max=15, max_comment_hour=30,
                    max_thread=2, max_user_day=5, dm_hour=0)),
-    "normal": ("⚖️ Seimbang", "Hampir semua dibalas dengan jeda pendek. Batas 40 komentar per jam.",
-               dict(reply_prob=100, thread_prob=70, delay_min=0, delay_max=3, max_comment_hour=40,
-                    max_thread=3, max_user_day=10, dm_hour=0)),
-    "aktif": ("🚀 Aktif Penuh", "Semua dibalas secepat mungkin, tanpa batas per jam. Kuota gratis cepat habis.",
-              dict(reply_prob=100, thread_prob=100, delay_min=0, delay_max=3, max_comment_hour=0,
-                   max_thread=5, max_user_day=20, dm_hour=0)),
+    "normal": ("⚖️ Seimbang", "Semua pesan dibalas dengan jeda pendek; tanpa batas buatan per jam.",
+               dict(reply_prob=100, thread_prob=100, delay_min=0, delay_max=2, max_comment_hour=0,
+                    max_thread=0, max_user_day=0, dm_hour=0)),
+    "aktif": ("🚀 Aktif Penuh", "Semua pesan dibalas secepat mungkin. Tetap mengikuti batas provider AI dan Telegram.",
+              dict(reply_prob=100, thread_prob=100, delay_min=0, delay_max=1, max_comment_hour=0,
+                   max_thread=0, max_user_day=0, dm_hour=0)),
 }
 HELP = {
     "reply_prob": "Dari 100 menfess yang masuk, berapa yang dibalas. 100 berarti semua dibalas.",
@@ -129,33 +132,41 @@ HELP = {
     "delay_max": "Waktu tunggu paling lama. Bot memilih acak antara jeda cepat dan jeda lama.",
     "max_comment_hour": "Batas komentar menfess per jam. Berguna supaya kuota AI gratis tidak cepat habis. 0 berarti tanpa batas.",
     "max_age_min": "Kalau bot sempat mati, postingan yang lebih tua dari ini tidak dibalas supaya tidak terlihat aneh.",
-    "max_thread": "Berapa kali bot boleh membalas dalam satu menfess (satu thread).",
-    "max_user_day": "Berapa kali bot boleh membalas satu orang yang sama dalam sehari.",
+    "max_thread": "Berapa kali bot boleh membalas dalam satu menfess (satu thread). 0 berarti bebas.",
+    "max_user_day": "Berapa kali bot boleh membalas satu orang yang sama dalam sehari. 0 berarti bebas.",
     "dm_hour": "Batas balasan DM per jam untuk setiap orang. 0 berarti tanpa batas, AI membalas terus.",
 }
 DEFAULTS = {
     "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False,
+    "group_on": True, "manual_takeover": False,
     "notify": True, "notify_ok": False,
-    "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 0, "delay_max": 3,
-    "max_comment_hour": 40, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 0,
-    "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": ["openrouter"],
+    "reply_prob": 100, "thread_prob": 100, "min_len": 0, "delay_min": 0, "delay_max": 1,
+    "max_comment_hour": 0, "max_age_min": 1440, "max_thread": 0, "max_user_day": 0, "dm_hour": 0,
+    "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": [],
     "model_gemini": MODELS["gemini"][0],
     "model_groq": MODELS["groq"][0],
     "model_openrouter": MODELS["openrouter"][0],
     "persona": "teman", "style": "x", "reply_len": "auto", "prompt": "",
     "learn_on": True, "vision_on": True, "ignore_names": ["rose"], "learn_ts": 0,
-    "banned": ["@"],
+    "banned": [],
 }
-SETTINGS_VERSION = 12   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
+SETTINGS_VERSION = 13   # versi 13: default balasan penuh + asisten grup + belajar incremental
 POLL_SEC = 10          # jeda cek berkala channel (cadangan kalau update realtime tidak masuk)
-SEND_GAP = 2.5         # jeda minimal antar komentar, mencegah FloodWait
-LEARN_EVERY = 12 * 3600  # jeda belajar otomatis dari channel
-MAX_EXAMPLES = 20000     # contoh tersimpan per channel (yang paling lama dibuang kalau penuh)
+SEND_GAP = 1.5         # jeda minimal antar komentar, tetap memberi ruang untuk batas Telegram
+LEARN_EVERY = 5 * 60   # periksa postingan baru setiap 5 menit
+LEARN_INCREMENT = 250  # maksimal postingan baru per channel per siklus
+MAX_EXAMPLES = 250000   # menampung dataset penuh + versi impor lama + contoh komentar baru
 BACKUP_TAG = "#menfess_backup"   # penanda file backup di Pesan Tersimpan akun userbot
 BACKUP_EVERY = 900       # detik: selama belajar lama, backup tiap 15 menit
-LEARN_PARALLEL = 4       # berapa postingan dipelajari bersamaan (makin besar makin cepat, tapi rawan FloodWait)
-LEARN_PAGE = 100         # postingan diambil per halaman
-LEARN_GAP = 0.3          # jeda singkat antar kelompok postingan
+LEARN_PARALLEL = 5       # beberapa thread dipelajari bersamaan; FloodWait tetap ditangani
+LEARN_PAGE = 150         # postingan diambil per halaman
+LEARN_GAP = 0.05         # jeda sangat singkat antar kelompok postingan
+DM_RESCAN_SEC = 60      # cek ulang DM yang mungkin luput dari event realtime
+DISC_POLL_SEC = 30       # pulihkan komentar diskusi yang muncul saat userbot offline
+DISC_POLL_LIMIT = 250    # komentar yang disapu per grup setiap siklus
+DM_EXAMPLE_CH = os.getenv("DM_EXAMPLE_CHANNEL", "basegaje")   # channel sumber contoh gaya untuk DM dan grup
+DM_CATCHUP_MAX_HOURS = int(os.getenv("DM_CATCHUP_MAX_HOURS") or 72)   # sapuan DM tidak membalas pesan lebih tua dari ini (0 = tanpa batas)
+BACKUP_MAX_BYTES = 100_000_000   # batas ukuran file backup yang boleh dipulihkan
 SETCNT = "INSERT INTO counters(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
 DISCLOSURE = (
     "Halo! 👋 Aku asisten AI-nya Newt (@sticksc), dibuat dan dikelola langsung oleh Newt.\n"
@@ -172,6 +183,7 @@ MODE_TEXT = {
     ),
     "reply": "Kamu sedang membalas seseorang di thread komentar sebuah menfess. Lanjutkan percakapan dengan relevan.",
     "dm": "Kamu sedang membalas pesan pribadi dari seseorang. Tanggapi sesuai isi pesannya.",
+    "group": "Kamu adalah asisten yang ikut membantu percakapan grup. Jawab hanya hal yang ditujukan kepadamu, tetap ringkas, relevan, dan tidak mengambil alih obrolan.",
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -187,6 +199,15 @@ CREATE TABLE IF NOT EXISTS seen (chat_id INTEGER, post_id INTEGER, PRIMARY KEY(c
 CREATE TABLE IF NOT EXISTS cursor (chat_id INTEGER PRIMARY KEY, last_id INTEGER);
 CREATE TABLE IF NOT EXISTS examples (id INTEGER PRIMARY KEY AUTOINCREMENT, ch TEXT, kind TEXT, src TEXT,
     reply TEXT, ts INTEGER, UNIQUE(ch, kind, src, reply));
+CREATE TABLE IF NOT EXISTS dm_queue (
+    chat_id INTEGER NOT NULL, msg_id INTEGER NOT NULL, created_ts INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+    next_try INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+    legacy INTEGER NOT NULL DEFAULT 0, reply TEXT NOT NULL DEFAULT '', sent_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(chat_id, msg_id));
+CREATE INDEX IF NOT EXISTS dm_queue_pending ON dm_queue(status, next_try, created_ts);
+CREATE TABLE IF NOT EXISTS dm_cursor (chat_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS discussion_cursor (chat_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);
 """
 
 WIB = timezone(timedelta(hours=7))
@@ -194,6 +215,9 @@ STARTED = time.time()
 bot = None
 ub = None
 db = None
+DB_LOCK = asyncio.Lock()  # kunci semua operasi SQLite; melindungi transaksi DM dari task lain
+EXAMPLE_LOCKS = {}  # (channel, kind) -> lock, supaya cache tidak dimuat ulang berbarengan
+EXAMPLE_CACHE = {}  # (channel, kind) -> (loaded_at, full example set with pre-tokenized text)
 LOGIN = {}      # client login OTP yang sedang berjalan
 PENDING = {}    # session string yang menunggu diaktifkan
 LAST = {}       # info postingan terakhir yang terdeteksi
@@ -234,6 +258,11 @@ async def db_init():
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
+    # Schema kecil ini bisa di-upgrade tanpa menghapus antrean yang sudah ada.
+    dm_columns = await q("PRAGMA table_info(dm_queue)")
+    if dm_columns and not any(col["name"] == "legacy" for col in dm_columns):
+        await db.execute("ALTER TABLE dm_queue ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
     rows = await q("SELECT value FROM settings WHERE key='settings_version'")
     old = json.loads(rows[0]["value"]) if rows else 0
     if old != SETTINGS_VERSION:
@@ -247,17 +276,21 @@ async def db_init():
     for k, v in DEFAULTS.items():
         await db.execute("INSERT OR IGNORE INTO settings VALUES(?, ?)", (k, json.dumps(v)))
     await db.execute("DELETE FROM seen WHERE rowid NOT IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT 5000)")
+    # Pesan yang sedang diproses saat proses mati harus masuk antrean lagi.
+    await db.execute("UPDATE dm_queue SET status='pending', next_try=0 WHERE status='processing'")
     await db.commit()
 
 
 async def q(sql, args=()):
-    cur = await db.execute(sql, args)
-    return [dict(r) for r in await cur.fetchall()]
+    async with DB_LOCK:
+        cur = await db.execute(sql, args)
+        return [dict(r) for r in await cur.fetchall()]
 
 
 async def x(sql, args=()):
-    await db.execute(sql, args)
-    await db.commit()
+    async with DB_LOCK:
+        await db.execute(sql, args)
+        await db.commit()
 
 
 async def settings():
@@ -323,6 +356,53 @@ async def hist_get(key, n=12):
     )
 
 
+async def import_learning_dataset(path=None):
+    """Impor dataset JSON opsional (contoh: menfess_belajar.json) sekali per database."""
+    path = path or os.getenv("LEARN_DATASET_PATH", "menfess_belajar.json")
+    if await count("dataset_imported_v2"):
+        return 0
+    if not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        examples = payload.get("examples", []) if isinstance(payload, dict) else payload
+        if not isinstance(examples, list):
+            raise ValueError("format dataset harus berupa array atau objek dengan key 'examples'")
+        added = 0
+        for start in range(0, len(examples), 1000):
+            batch = []
+            for row in examples[start:start + 1000]:
+                if not isinstance(row, dict):
+                    continue
+                ch = str(row.get("ch") or "").strip().lstrip("@")[:80]
+                kind = str(row.get("kind") or "").strip().lower()
+                src = clean_ex(str(row.get("src") or ""), 2000)
+                reply = clean_ex(str(row.get("reply") or ""), 4000)
+                if not ch or kind not in ("menfess", "reply") or len(src) < 1 or len(reply) < 2:
+                    continue
+                try:
+                    ts = int(row.get("ts") or time.time())
+                except (TypeError, ValueError):
+                    ts = int(time.time())
+                batch.append((ch, kind, src, reply, ts))
+            if batch:
+                async with DB_LOCK:
+                    cur = await db.executemany(
+                        "INSERT OR IGNORE INTO examples(ch, kind, src, reply, ts) VALUES(?, ?, ?, ?, ?)",
+                        batch,
+                    )
+                    added += max(cur.rowcount, 0)
+                    await db.commit()
+        EXAMPLE_CACHE.clear()
+        await x(SETCNT, ("dataset_imported_v2", 1))
+        await log_("INFO", f"Dataset belajar versi penuh diimpor: {added} contoh baru dari {len(examples)} baris")
+        return added
+    except Exception as e:
+        await log_("ERROR", f"Impor dataset gagal: {short(e)}")
+        return 0
+
+
 # ---------- belajar dari balasan asli ----------
 
 URL_RE = re.compile(r"https?://\S+|t\.me/\S+|www\.\S+|@\w+")
@@ -335,72 +415,101 @@ def clean_ex(t, limit=200):
 
 
 def tokens(t):
-    return {w for w in re.findall(r"\w+", (t or "").lower()) if len(w) >= 4}
+    # Kata 3 huruf seperti aku/dia/gak juga penting untuk kecocokan bahasa gaul Indonesia.
+    return {w for w in re.findall(r"\w+", (t or "").lower()) if len(w) >= 3}
 
 
 def is_ignored(sender, s):
-    """Akun bot selalu diabaikan, begitu juga nama di daftar abaikan (contoh: Rose)."""
+    """Abaikan akun bot, akun layanan Telegram, dan nama yang ada di daftar abaikan (default: Rose)."""
     if sender is None:
         return False
     if getattr(sender, "bot", False) or getattr(sender, "id", None) == 777000:
         return True
-    ident = " ".join(str(getattr(sender, k, None) or "") for k in ("first_name", "last_name", "username", "title")).lower()
-    return any(
-        re.search(rf"(?<!\w){re.escape(n.strip().lower())}(?!\w)", ident)
-        for n in s.get("ignore_names", []) if n.strip()
-    )
+    fields = [str(getattr(sender, k, None) or "") for k in ("first_name", "last_name", "username", "title")]
+    ident = " ".join(fields).lower().replace("@", " ")
+    tokens_ = set(re.findall(r"[a-z0-9]+", ident))
+    compact = re.sub(r"[^a-z0-9]", "", ident)
+    for name in s.get("ignore_names", []):
+        n = re.sub(r"[^a-z0-9]", "", str(name or "").lower().lstrip("@"))
+        if n and (n in tokens_ or n == compact or any(v.lower().lstrip("@") == n for v in fields)):
+            return True
+    return False
 
 
 async def add_example(ch, kind, src, reply, ts=None):
-    cur = await db.execute(
-        "INSERT OR IGNORE INTO examples(ch, kind, src, reply, ts) VALUES(?, ?, ?, ?, ?)",
-        (ch, kind, src, reply, ts or int(time.time())),
-    )
-    return max(cur.rowcount, 0)
+    async with DB_LOCK:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO examples(ch, kind, src, reply, ts) VALUES(?, ?, ?, ?, ?)",
+            (ch, kind, src, reply, ts or int(time.time())),
+        )
+        if cur.rowcount > 0:
+            EXAMPLE_CACHE.pop((ch, kind), None)
+        return max(cur.rowcount, 0)
+
+
+def pick_examples(data, want, n):
+    """Pilih n contoh paling mirip topik dari seluruh data (fungsi sinkron, aman dijalankan di thread)."""
+    if want:
+        candidates = heapq.nlargest(
+            max(n * 12, 48),
+            data,
+            key=lambda r: (len(want & r[2]), r[3]),
+        )
+    else:
+        candidates = data[:max(n * 12, 48)]
+    picked, seen_src = [], set()
+    for src, reply, _tok, _ts in candidates:
+        if src in seen_src:
+            continue
+        seen_src.add(src)
+        picked.append((src, reply))
+        if len(picked) >= n:
+            break
+    # Bila topik sangat spesifik, isi slot tersisa dengan contoh terbaru agar AI tetap punya acuan.
+    if len(picked) < n:
+        for src, reply, _tok, _ts in data:
+            if src in seen_src:
+                continue
+            seen_src.add(src)
+            picked.append((src, reply))
+            if len(picked) >= n:
+                break
+    return picked
 
 
 async def examples_block(ch_username, kind, text, s, n=4):
-    """Contoh balasan asli (yang paling mirip topiknya dulu) untuk ditempel ke prompt AI."""
+    """Cari contoh relevan dari SELURUH dataset channel, bukan hanya 12.000 baris terbaru."""
     if not s["learn_on"]:
         return ""
-    rows = await q("SELECT src, reply FROM examples WHERE ch=? AND kind=? ORDER BY ts DESC LIMIT 6000",
-                   (ch_username, kind))
-    if not rows:
+    key = (ch_username, kind)
+    cached = EXAMPLE_CACHE.get(key)
+    if cached is None or time.time() - cached[0] > 300:
+        lock = EXAMPLE_LOCKS.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = EXAMPLE_CACHE.get(key)   # mungkin sudah dimuat task lain saat menunggu kunci
+            if cached is None or time.time() - cached[0] > 300:
+                rows = await q(
+                    "SELECT src, reply, ts FROM examples WHERE ch=? AND kind=? ORDER BY ts DESC",
+                    (ch_username, kind),
+                )
+                data = await asyncio.to_thread(
+                    lambda: [(r["src"], r["reply"], tokens(r["src"]), int(r["ts"] or 0)) for r in rows]
+                )
+                cached = (time.time(), data)
+                EXAMPLE_CACHE[key] = cached
+    data = cached[1]
+    if not data:
         return ""
-    want = tokens(text)
-    rows.sort(key=lambda r: (-len(want & tokens(r["src"])), random.random()))
-    picked, seen = [], set()
-    for r in rows:
-        if r["src"] not in seen:
-            seen.add(r["src"])
-            picked.append(r)
-        if len(picked) >= n:
-            break
+
+    # Skoring ratusan ribu baris dijalankan di thread supaya event loop (balasan DM/komentar) tidak tersendat.
+    picked = await asyncio.to_thread(pick_examples, data, tokens(text), n)
+
     a, b = ("Menfess", "Komentar") if kind == "menfess" else ("Komentar", "Balasan")
-    body = "\n\n".join(f'{a}: "{r["src"][:160]}"\n{b}: "{r["reply"][:160]}"' for r in picked)
+    body = "\n\n".join(f'{a}: "{src[:500]}"\n{b}: "{reply[:500]}"' for src, reply in picked)
     return (
-        "Contoh balasan ASLI dari pengunjung channel ini, hanya sebagai pedoman nada dan panjang. "
-        "Tiru gayanya, jangan menyalin kalimatnya, dan abaikan contoh yang kasar atau menghina:\n\n" + body
-    )
-
-
-async def claim(chat_id, post_id):
-    """True hanya untuk pemanggil pertama, sehingga satu postingan tidak dibalas dua kali."""
-    cur = await db.execute("INSERT OR IGNORE INTO seen(chat_id, post_id) VALUES(?, ?)", (chat_id, post_id))
-    await db.commit()
-    return cur.rowcount == 1
-
-
-async def cursor_get(chat_id):
-    rows = await q("SELECT last_id FROM cursor WHERE chat_id=?", (chat_id,))
-    return rows[0]["last_id"] if rows else None
-
-
-async def cursor_bump(chat_id, post_id):
-    await x(
-        "INSERT INTO cursor(chat_id, last_id) VALUES(?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
-        (chat_id, post_id),
+        "Contoh percakapan asli pengunjung channel ini yang dipilih dari seluruh data berdasarkan "
+        "kemiripan topik. Gunakan untuk memahami konteks, gaya bahasa, dan cara orang menanggapi; "
+        "jangan menyalin mentah atau mengikuti contoh yang kasar/menghina:\n\n" + body
     )
 
 
@@ -475,11 +584,17 @@ def system_prompt(s, mode):
         "dengan gaya bahasamu. Jangan menyebut identitas ini kalau tidak ditanya.",
         "Jangan menghina, memprovokasi, membahas SARA, konten seksual, atau kekerasan.",
         "Jangan meminta atau membagikan data pribadi.",
-        "Jangan memaksakan percakapan.",
+        "Jangan memaksakan percakapan dan jangan mengarang fakta yang tidak diketahui.",
+        "Pahami typo, singkatan, slang, candaan, konteks fandom, roleplay, dan bahasa campuran dari konteks kalimat. "
+        "Contoh: 'ava' biasanya avatar/foto profil; 'pfp' berarti profile picture. Dalam konteks RP, 'muse' dapat berarti "
+        "karakter/persona yang dimainkan, sedangkan 'face claim' adalah sosok visual yang dipakai untuk menggambarkannya. "
+        "Jangan menyamakan semua istilah itu; kalau maknanya belum jelas, tanyakan singkat dengan natural.",
+        "Jangan SKIP hanya karena istilah, singkatan, atau maksud pesan belum dipahami. Gunakan konteks; bila perlu, "
+        "balas dengan pertanyaan klarifikasi yang sopan. Jangan pura-pura paham.",
         "Keluarkan hanya teks balasan, tanpa label atau tanda kutip.",
     ]
     if mode == "reply":
-        rules.insert(5, "Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP")
+        rules.insert(5, "Jika pesan jelas spam atau provokasi, jawab persis: SKIP. Jika hanya ambigu atau tidak familier, jangan SKIP; tanyakan maksudnya dengan singkat.")
     if mode == "dm":
         rules.insert(len(rules) - 1,
                      "Ini chat pribadi, jadi balas seperti orang mengetik di WhatsApp: pecah balasan jadi 2 sampai 4 "
@@ -581,7 +696,17 @@ async def call(http, name, model, system, msgs, max_out=300, image=None):
     )
     if r.status_code >= 400:
         raise RuntimeError(http_err(r.status_code))
-    return r.json()["choices"][0]["message"]["content"]
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("respons bukan JSON valid") from None
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not choices:
+        # OpenRouter kadang membalas HTTP 200 dengan isi {"error": {...}}
+        err = data.get("error") if isinstance(data, dict) else None
+        detail = (err.get("message") if isinstance(err, dict) else err) or "respons kosong"
+        raise RuntimeError(f"respons kosong ({str(detail)[:80]})")
+    return (choices[0].get("message") or {}).get("content") or ""
 
 
 async def ask_ai(mode, msgs, s, image=None, extra=""):
@@ -607,11 +732,12 @@ async def ask_ai(mode, msgs, s, image=None, extra=""):
                             text = text.lower()
                         return text[:LENGTHS[s["reply_len"]][3]]
                     errs.append(f"{NAMES[name]}: respons kosong")
-                    break
+                    continue   # model lain di provider yang sama mungkin menjawab
                 except Exception as e:
                     errs.append(f"{NAMES[name]}: {short(e)}")
-                    if isinstance(e, httpx.TimeoutException) or any(
-                        c in str(e) for c in ("HTTP 404", "HTTP 400", "HTTP 429", "HTTP 5")
+                    if isinstance(e, (httpx.TimeoutException, httpx.TransportError)) or any(
+                        c in str(e) for c in ("HTTP 404", "HTTP 400", "HTTP 429", "HTTP 5",
+                                              "respons kosong", "diblokir")
                     ):
                         continue   # kuota/overload/pensiun: tiap model punya kuota sendiri, coba model lain
                     break          # 401/403 = masalah API key, model lain juga pasti gagal
@@ -669,7 +795,7 @@ async def humanize(s):
 
 async def find_root(m):
     """Telusuri rantai reply sampai ke postingan menfess asli (auto-forward)."""
-    for _ in range(8):
+    for _ in range(50):
         if m.fwd_from and m.fwd_from.channel_post:
             return m
         if not m.reply_to_msg_id:
@@ -693,12 +819,21 @@ class UB:
         self.albums = set()
         self.joined = set()
         self.ai_at = {}
-        self.dm_locks = {}   # uid -> lock, supaya bubble satu percakapan tidak tercampur
+        self.dm_locks = {}   # chat id -> lock, supaya urutan DM satu percakapan terjaga
+        self.dm_peers = {}   # chat id -> InputPeer/User dari dialog/event
+        self.dm_active_chats = set()
+        self.dm_scanning_chats = set()  # jangan proses antrean sampai sapuan riwayat chat selesai
+        self.dm_initializing = True
+        self.dm_worker = None
+        self.dm_reconciler = None
+        self.dm_scan_lock = asyncio.Lock()
         self.tasks = set()
         self.poller = None
         self.learning = False
+        self.last_backup = 0.0  # kapan backup terakhir berhasil (untuk throttle)
         self.next_learn = 0.0   # kapan terakhir dicek perlu belajar lagi atau belum
         self.next_resume = 0.0  # kapan terakhir dicek ada belajar yang harus dilanjutkan
+        self.next_disc_poll = 0.0
         self.learn_stop = False  # tombol Hentikan di panel
         self.prog = ""          # ringkasan progres belajar untuk panel
 
@@ -717,19 +852,26 @@ class UB:
         await self.refresh()
         self.ready = True
         self.poller = asyncio.create_task(self.poll_loop())
+        self.dm_worker = asyncio.create_task(self.dm_queue_loop())
+        self.dm_reconciler = asyncio.create_task(self.dm_reconcile_loop())
         self.spawn(self.auto_restore())
         log.info("Userbot aktif sebagai %s", self.me.first_name)
 
     async def stop(self):
         self.ready = False
-        if self.poller:
-            self.poller.cancel()
-            try:
-                await self.poller
-            except (asyncio.CancelledError, Exception):
-                pass
+        for task in (self.poller, self.dm_worker, self.dm_reconciler):
+            if task:
+                task.cancel()
+        background = [t for t in (self.poller, self.dm_worker, self.dm_reconciler) if t]
+        background += list(self.tasks)
         for t in list(self.tasks):
             t.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+        try:
+            await x("UPDATE dm_queue SET status='pending', next_try=0 WHERE status='processing'")
+        except Exception:
+            pass
         try:
             self.c.remove_event_handler(self.on_in)
             self.c.remove_event_handler(self.on_out)
@@ -843,15 +985,18 @@ class UB:
 
     async def on_in(self, ev):
         if ev.is_private:
-            self.spawn(self.dm(ev))
+            self.spawn(self.enqueue_dm(ev))
         elif ev.chat_id in self.chans:
             if not ev.message.action:
                 self.spawn(self.on_post(ev.message, self.chans[ev.chat_id], "realtime"))
         elif ev.chat_id in self.by_disc:
             self.spawn(self.group(ev))
+        elif ev.is_group:
+            self.spawn(self.group_assistant(ev))
 
     async def on_out(self, ev):
         if ev.is_private and ev.chat_id != self.me.id:
+            self.spawn(self.mark_manual_dm_reply(ev))
             self.spawn(self.takeover(ev))
 
     # ----- cek berkala (cadangan kalau update realtime tidak masuk) -----
@@ -869,12 +1014,12 @@ class UB:
                 except Exception as e:
                     log.warning("lanjut belajar gagal: %s", e)
             if time.time() >= self.next_learn:
-                # Belajar otomatis dari channel: cek tiap jam, jalan kalau sudah lewat 12 jam.
-                self.next_learn = time.time() + 3600
+                # Belajar incremental: ambil postingan baru setelah ID terakhir, bukan mengulang 30 post yang sama.
+                self.next_learn = time.time() + LEARN_EVERY
                 try:
                     s0 = await settings()
-                    if s0["learn_on"] and time.time() - s0["learn_ts"] > LEARN_EVERY:
-                        self.spawn(self.learn_all(30))
+                    if s0["learn_on"] and not self.learning:
+                        self.spawn(self.learn_recent_all(LEARN_INCREMENT))
                 except Exception as e:
                     log.warning("jadwal belajar gagal: %s", e)
             for ch in list(self.chans.values()):
@@ -891,6 +1036,17 @@ class UB:
                         f"📡 @{esc(ch['username'])}\n❓ {esc(explain(e))}",
                         key=f"poll:{ch['username']}", every=300,
                     )
+            if time.time() >= self.next_disc_poll:
+                self.next_disc_poll = time.time() + DISC_POLL_SEC
+                for ch in list(self.chans.values()):
+                    if not self.ready:
+                        break
+                    try:
+                        await self.poll_discussion(ch)
+                    except errors.FloodWaitError as e:
+                        await asyncio.sleep(min(e.seconds + 1, 120))
+                    except Exception as e:
+                        await log_("ERROR", f"Cek komentar @{ch['username']} gagal: {short(e)}")
             await asyncio.sleep(POLL_SEC)
 
     async def poll(self, ch):
@@ -902,12 +1058,50 @@ class UB:
             last = await self.c.get_messages(ent, limit=1)
             await cursor_bump(ch["chat_id"], last[0].id if last else 0)
             return
-        msgs = await self.c.get_messages(ent, limit=30, min_id=cur)
+        msgs = await self.c.get_messages(ent, limit=30, min_id=cur, reverse=True)
         msgs = [m for m in msgs if m]
         for m in sorted((m for m in msgs if not m.action), key=lambda m: m.id):
             await self.on_post(m, ch, "cek berkala")
         if msgs:
             await cursor_bump(ch["chat_id"], max(m.id for m in msgs))
+
+    async def poll_discussion(self, ch):
+        """Pulihkan komentar diskusi baru sejak cursor, termasuk komentar saat userbot offline."""
+        disc_id = ch.get("disc_id")
+        if not disc_id:
+            return
+        group = self.groups.get(disc_id)
+        if group is None:
+            await self.load(ch)
+            group = self.groups.get(disc_id) or disc_id
+        rows = await q("SELECT last_id FROM discussion_cursor WHERE chat_id=?", (disc_id,))
+        last_id = int(rows[0]["last_id"]) if rows else 0
+        if not last_id:
+            latest = await self.c.get_messages(group, limit=1)
+            latest_id = latest[0].id if latest else 0
+            await x(
+                "INSERT INTO discussion_cursor(chat_id, last_id) VALUES(?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
+                (disc_id, latest_id),
+            )
+            return  # arsip lama sudah dicakup oleh mode Pelajari SEMUA isi channel
+
+        messages = await self.c.get_messages(
+            group, limit=DISC_POLL_LIMIT, min_id=last_id, reverse=True
+        )
+        messages = [m for m in messages if m]
+        if not messages:
+            return
+        s = await settings()
+        for msg in sorted(messages, key=lambda m: m.id):
+            if msg.action or msg.sender_id == self.me.id:
+                continue
+            await self.learn_discussion_message(msg, ch, s)
+        await x(
+            "INSERT INTO discussion_cursor(chat_id, last_id) VALUES(?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
+            (disc_id, max(m.id for m in messages)),
+        )
 
     # ----- A. menfess masuk channel -----
     async def group(self, ev):
@@ -922,8 +1116,141 @@ class UB:
         )
         if from_channel:
             return await self.on_post(None, ch, "grup diskusi", group_msg=msg)
-        if msg.reply_to_msg_id and msg.sender_id != self.me.id:
-            return await self.reply(msg, await settings())
+        if msg.sender_id == self.me.id:
+            return
+        s = await settings()
+        # Setiap komentar user dipelajari realtime; yang diabaikan termasuk Rose dan akun bot.
+        try:
+            await self.learn_discussion_message(msg, ch, s)
+        except Exception as e:
+            await log_("ERROR", f"Belajar komentar realtime @{ch['username']} gagal: {short(e)}")
+        if msg.reply_to_msg_id:
+            target = await msg.get_reply_message()
+            if target and target.sender_id == self.me.id:
+                return await self.reply(msg, s)
+        return await self.group_assistant(ev)
+
+    async def learn_discussion_message(self, msg, ch, s=None):
+        """Simpan komentar baru langsung saat muncul di grup diskusi, termasuk reply bertingkat."""
+        s = s or await settings()
+        if not msg or msg.sender_id in (None, self.me.id) or msg.action:
+            return 0
+        try:
+            sender = msg.sender or await msg.get_sender()
+        except Exception:
+            sender = None
+        if sender is None or is_ignored(sender, s):
+            return 0
+
+        raw = (msg.message or "").strip()
+        if not raw:
+            if getattr(msg, "photo", None):
+                raw = "[foto]"
+            elif getattr(msg, "sticker", None):
+                raw = "[stiker]"
+            elif getattr(msg, "video", None):
+                raw = "[video]"
+            else:
+                return 0
+        text = clean_ex(raw, 4000)
+        if not text:
+            return 0
+
+        root = await find_root(msg)
+        if root is None:
+            return 0
+        parent = await msg.get_reply_message() if msg.reply_to_msg_id else None
+        ts = int(msg.date.timestamp()) if msg.date else None
+        added = 0
+        if parent is not None and parent.id != root.id:
+            try:
+                parent_sender = parent.sender or await parent.get_sender()
+            except Exception:
+                parent_sender = None
+            parent_text = clean_ex(parent.message, 4000)
+            if not parent_text:
+                parent_text = ("[foto]" if getattr(parent, "photo", None) else
+                               "[stiker]" if getattr(parent, "sticker", None) else
+                               "[video]" if getattr(parent, "video", None) else "")
+            # Komentar manusia tetap dipelajari walaupun ia membalas bot (termasuk Rose).
+            # Isi bot tidak dipakai sebagai contoh; hanya penanda konteks yang disimpan.
+            if (parent_sender is None or is_ignored(parent_sender, s)
+                    or parent.sender_id == self.me.id or not parent_text):
+                parent_text = "[balasan ke komentar bot/komentar yang dikecualikan]"
+            added = await add_example(ch["username"], "reply", parent_text, text, ts)
+        else:
+            root_text = clean_ex(root.message, 2000)
+            if not root_text:
+                root_text = "[foto]" if getattr(root, "photo", None) else "[menfess media]"
+            added = await add_example(ch["username"], "menfess", root_text, text, ts)
+        if added:
+            async with DB_LOCK:
+                await db.commit()
+        return added
+
+    async def group_assistant(self, ev):
+        """Asisten grup: hanya merespons bila di-mention atau pesan membalas pesan bot."""
+        s = await settings()
+        if not s.get("group_on", True):
+            return
+        msg = ev.message
+        if not msg or msg.sender_id in (None, self.me.id):
+            return
+        sender = await msg.get_sender()
+        if is_ignored(sender, s):
+            return
+        u = await user(msg.sender_id)
+        if u["lst"] == "black":
+            return
+        username = (getattr(self.me, "username", None) or "").lower()
+        raw = (msg.raw_text or "").strip()
+        mention = bool(username and re.search(rf"(?<!\w)@{re.escape(username)}\b", raw, re.I))
+        target = await msg.get_reply_message() if msg.reply_to_msg_id else None
+        replied_to_bot = bool(target and target.sender_id == self.me.id)
+        if not mention and not replied_to_bot:
+            return
+        if not raw and not msg.photo and not msg.sticker and not msg.video:
+            return
+        image = None
+        media_note = ""
+        if getattr(msg, "photo", None):
+            media_note = "Anggota grup mengirim foto."
+            try:
+                data = await self.c.download_media(msg, file=bytes)
+                if data and len(data) <= 4_000_000:
+                    image = data
+                elif data:
+                    media_note += " Ukuran foto terlalu besar untuk dikirim ke model."
+            except Exception as e:
+                log.warning("Foto grup gagal diunduh: %s", short(e))
+        elif getattr(msg, "sticker", None):
+            media_note = "Anggota grup mengirim stiker."
+        elif getattr(msg, "video", None):
+            media_note = "Anggota grup mengirim video; isi video tidak dapat dianalisis."
+        elif getattr(msg, "voice", None) or getattr(msg, "audio", None):
+            media_note = "Anggota grup mengirim audio/pesan suara; audio belum ditranskripsikan."
+        text = re.sub(rf"(?<!\w)@{re.escape(username)}\b", "", raw, flags=re.I).strip() if username else raw
+        if media_note:
+            text = (text + "\n" + media_note).strip()
+        text = text or "boleh bantu jelaskan ini?"
+        name = getattr(sender, "first_name", None) or "anggota grup"
+        thread_id = getattr(getattr(msg, "reply_to", None), "reply_to_top_id", None) or (target.id if replied_to_bot else 0)
+        key = f"group:{msg.chat_id}:{thread_id or 'main'}"
+        lock_key = f"group:{msg.chat_id}:{thread_id or 'main'}"
+        async with self.dm_lock(lock_key):
+            await hist_add(key, "user", f"{name}: {text}")
+            await humanize(s)
+            extra = await examples_block(DM_EXAMPLE_CH, "reply", text, s, n=3)
+            async with AI_SEM:
+                reply = await ask_ai("group", await hist_get(key, 12), s, image=image, extra=extra)
+            if is_skip(reply) or not reply.strip():
+                return await skip("asisten grup tidak menghasilkan balasan")
+            async with SEND_LOCK:
+                await self.typing(msg.chat_id, min(1 + len(reply) * 0.03, 3))
+                await self.say(msg.chat_id, reply, reply_to=msg.id)
+                await asyncio.sleep(SEND_GAP)
+            await hist_add(key, "assistant", reply)
+            await stat("group")
 
     async def on_post(self, msg, ch, src, group_msg=None):
         base = msg if msg is not None else group_msg
@@ -1017,8 +1344,12 @@ class UB:
             except AIError as e:
                 last_err = str(e)
                 await log_("ERROR", f"AI gagal #{post_id} (percobaan {attempt}/3): {last_err}")
-                if attempt < 3:
-                    await asyncio.sleep(8 * attempt)
+                # Kalau seluruh provider menjawab 429/401/404, retry hanya membuang kuota.
+                retryable = any(mark in last_err for mark in ("Timeout", "ReadTimeout", "ConnectTimeout", "HTTP 5"))
+                if attempt < 3 and retryable:
+                    await asyncio.sleep(4 * attempt)
+                else:
+                    break
         if reply is None:
             await stat("error")
             return await report(
@@ -1092,51 +1423,98 @@ class UB:
 
     # ----- belajar dari channel -----
     async def learn_post(self, ent, post, s, user_ch):
-        """Pelajari satu postingan. None = dilewati (tanpa membaca komentar), angka = contoh baru yang tersimpan."""
-        if post.action or not (post.message or post.photo):
+        """Pelajari SEMUA komentar dan balasan bertingkat pada satu postingan.
+
+        limit=None penting: Telegram akan mem-paginate seluruh thread, bukan berhenti di 100 komentar.
+        Hanya teks percakapan yang disimpan; bot (termasuk Rose) dan userbot sendiri dikecualikan.
+        """
+        if post.action or not (post.message or post.photo or post.video):
             return None
-        src = clean_ex(post.message, 160) or ("[foto]" if post.photo else "")
+        src = clean_ex(post.message, 2000) or ("[foto]" if post.photo else "[media]")
         if not src:
             return None
-        for _ in range(2):
-            comments = []
+
+        comments = []
+        for attempt in range(5):
             try:
-                async for m in self.c.iter_messages(ent, reply_to=post.id, limit=60):
+                async for m in self.c.iter_messages(ent, reply_to=post.id, limit=None):
                     comments.append(m)
                 break
             except errors.FloodWaitError as e:
-                await asyncio.sleep(min(e.seconds + 1, 90))
-            except Exception:
-                return None   # postingan tanpa kolom komentar
+                await asyncio.sleep(min(e.seconds + 1, 300))
+            except errors.MsgIdInvalidError:
+                # Posting tidak memiliki thread komentar aktif.
+                return 0
+            except Exception as e:
+                if attempt >= 4:
+                    raise RuntimeError(f"gagal membaca semua komentar post #{post.id}: {short(e)}") from e
+                await asyncio.sleep(min(2 ** attempt, 20))
         else:
-            return None
+            raise RuntimeError(f"gagal membaca thread post #{post.id} setelah beberapa percobaan")
+
+        # Simpan indeks semua komentar lebih dulu supaya balasan bertingkat dapat menemukan parent-nya.
         by_id = {m.id: m for m in comments}
         added = 0
         for m in comments:
             if m.action or m.sender_id == self.me.id:
                 continue
-            if m.sender is None or is_ignored(m.sender, s):
-                continue   # pengirim tidak bisa dipastikan bukan bot, jadi dilewati
-            if URL_RE.search(m.message or ""):
-                continue   # komentar berisi link/@mention biasanya spam atau promosi
-            txt = clean_ex(m.message, 200)
-            if len(txt) < 2:
+            try:
+                sender = m.sender or await m.get_sender()
+            except Exception:
+                sender = None
+            if sender is None or is_ignored(sender, s):
                 continue
+
+            raw_text = (m.message or "").strip()
+            if not raw_text:
+                if getattr(m, "photo", None):
+                    raw_text = "[foto]"
+                elif getattr(m, "sticker", None):
+                    raw_text = "[stiker]"
+                elif getattr(m, "video", None):
+                    raw_text = "[video]"
+                else:
+                    continue
+            txt = clean_ex(raw_text, 4000)
+            if not txt:
+                continue
+
             ts = int(m.date.timestamp()) if m.date else None
             rt = m.reply_to
             top = getattr(rt, "reply_to_top_id", None) if rt else None
-            nested = bool(rt and top and rt.reply_to_msg_id != top)   # balasan ke komentar lain
-            parent = by_id.get(m.reply_to_msg_id) if nested else None
-            if nested and parent is None:
-                continue   # komentar yang dibalas tidak ikut terbaca
-            if parent is not None:
-                ptxt = clean_ex(parent.message, 160)
-                if not ptxt or parent.sender_id == self.me.id or is_ignored(parent.sender, s):
-                    continue   # tidak belajar dari percakapan dengan bot atau komentar bot sendiri
+            parent_id = getattr(rt, "reply_to_msg_id", None) if rt else None
+            nested = bool(rt and top and parent_id and parent_id != top)
+            parent = by_id.get(parent_id) if nested else None
+            if nested and parent is None and parent_id:
+                # Fallback jika Telegram tidak mengikutsertakan parent di halaman thread.
+                try:
+                    parent = await self.c.get_messages(m.chat_id, ids=parent_id)
+                except Exception:
+                    parent = None
+            if nested:
+                ptxt = ""
+                if parent is not None:
+                    ptxt = clean_ex(parent.message, 4000)
+                    if not ptxt:
+                        ptxt = ("[foto]" if getattr(parent, "photo", None) else
+                                "[stiker]" if getattr(parent, "sticker", None) else
+                                "[video]" if getattr(parent, "video", None) else "")
+                    try:
+                        parent_sender = parent.sender or await parent.get_sender()
+                    except Exception:
+                        parent_sender = None
+                    if (parent.sender_id == self.me.id or parent_sender is None
+                            or is_ignored(parent_sender, s)):
+                        ptxt = "[balasan ke komentar bot/komentar yang dikecualikan]"
+                if not ptxt:
+                    ptxt = "[balasan ke komentar lain]"
+                # Balasan dari user tetap disimpan, termasuk jika parent-nya bot Rose.
                 added += await add_example(user_ch, "reply", ptxt, txt, ts)
             else:
                 added += await add_example(user_ch, "menfess", src, txt, ts)
-        await db.commit()
+
+        async with DB_LOCK:
+            await db.commit()
         return added
 
     async def fetch_page(self, ent, limit, offset):
@@ -1154,13 +1532,16 @@ class UB:
     async def learn_batch(self, ent, batch, s, user_ch):
         """Pelajari beberapa postingan sekaligus (paralel). Satu postingan gagal tidak menghentikan yang lain."""
         res = await asyncio.gather(*(self.learn_post(ent, p, s, user_ch) for p in batch), return_exceptions=True)
-        scanned = added = 0
+        scanned = added = failed = 0
         for r in res:
-            if isinstance(r, BaseException) or r is None:
+            if isinstance(r, BaseException):
+                failed += 1
+                continue
+            if r is None:
                 continue
             scanned += 1
             added += r
-        return scanned, added
+        return scanned, added, failed
 
     async def learn(self, ch, posts=40):
         """Baca postingan dan komentar aslinya. Yang disimpan hanya teks (tanpa nama atau ID).
@@ -1192,7 +1573,11 @@ class UB:
                     completed = False
                     break
                 batch = page[i:i + LEARN_PARALLEL]
-                sc, ad = await self.learn_batch(ent, batch, s, user_ch)
+                sc, ad, failed = await self.learn_batch(ent, batch, s, user_ch)
+                if failed:
+                    completed = False
+                    await log_("ERROR", f"Belajar @{user_ch}: {failed} post gagal; cursor ditahan agar bisa dicoba ulang.")
+                    raise RuntimeError(f"{failed} post gagal diproses; progres disimpan untuk percobaan ulang")
                 seen_posts += len(batch)
                 scanned += sc
                 added += ad
@@ -1215,11 +1600,80 @@ class UB:
                 "(SELECT id FROM examples WHERE ch=? ORDER BY ts DESC LIMIT ?)", (user_ch, user_ch, MAX_EXAMPLES))
         return scanned, added
 
+    async def learn_recent(self, ch, limit=LEARN_INCREMENT):
+        """Belajar postingan terbaru yang belum pernah diproses oleh siklus otomatis."""
+        s = await settings()
+        user_ch = ch["username"]
+        ent = self.ents.get(ch["chat_id"]) or await self.c.get_entity(user_ch)
+        key = f"learnrecent:{ch['chat_id']}"
+        last_id = await count(key)
+        if last_id:
+            # reverse=True mengambil ID paling tua setelah cursor terlebih dahulu; backlog tidak terlewati.
+            page = await self.c.get_messages(ent, limit=limit, min_id=last_id, reverse=True)
+        else:
+            page = await self.c.get_messages(ent, limit=limit)
+        page = sorted((m for m in page if m and not m.action), key=lambda m: m.id)
+        if not page:
+            return 0, 0
+        scanned = added = 0
+        for i in range(0, len(page), LEARN_PARALLEL):
+            if self.learn_stop:
+                break
+            batch = page[i:i + LEARN_PARALLEL]
+            sc, ad, failed = await self.learn_batch(ent, batch, s, user_ch)
+            if failed:
+                await log_("ERROR", f"Belajar incremental @{user_ch}: {failed} post gagal; cursor ditahan.")
+                raise RuntimeError(f"{failed} post gagal diproses; akan dicoba lagi pada siklus berikutnya")
+            scanned += sc
+            added += ad
+            last_id = max(m.id for m in batch)
+            await x(SETCNT, (key, last_id))
+            self.prog = f"@{user_ch}: {scanned}/{len(page)} post baru diproses, {added} contoh baru"
+            if sc:
+                await asyncio.sleep(LEARN_GAP)
+        await x("DELETE FROM examples WHERE ch=? AND id NOT IN "
+                "(SELECT id FROM examples WHERE ch=? ORDER BY ts DESC LIMIT ?)",
+                (user_ch, user_ch, MAX_EXAMPLES))
+        return scanned, added
+
+    async def learn_recent_all(self, limit=LEARN_INCREMENT):
+        """Siklus belajar berulang untuk postingan baru pada semua channel aktif."""
+        if self.learning or self.learn_stop or await count("learn_auto_paused"):
+            return
+        self.learning = True
+        self.prog = "Menyiapkan pembelajaran terbaru..."
+        lines, total = [], 0
+        try:
+            for ch in list(self.chans.values()):
+                if self.learn_stop:
+                    break
+                if ch.get("paused"):
+                    continue
+                try:
+                    scanned, added = await self.learn_recent(ch, limit)
+                    total += added
+                    lines.append(f"@{ch['username']}: {scanned} post baru, {added} contoh baru")
+                except errors.FloodWaitError as e:
+                    lines.append(f"@{ch['username']}: ditunda FloodWait {e.seconds} detik")
+                    await asyncio.sleep(min(e.seconds + 1, 300))
+                except Exception as e:
+                    lines.append(f"@{ch['username']}: gagal sementara ({short(e)})")
+                    await log_("ERROR", f"Belajar incremental @{ch['username']} gagal: {short(e)}")
+            if total:
+                await self.backup_safe()
+            if lines:
+                await setv("learn_ts", int(time.time()))
+                await log_("INFO", "Belajar incremental: " + "; ".join(lines))
+        finally:
+            self.learning = False
+            self.prog = ""
+
     async def learn_all(self, posts=40, who=False, only=None, resume=False):
         if self.learning:
             return
-        self.learning = True
+        await x(SETCNT, ("learn_auto_paused", 0))  # mulai manual berarti lanjutkan siklus otomatis
         self.learn_stop = False
+        self.learning = True
         self.prog = ""
         lines, total, had_err = [], 0, False
         try:
@@ -1252,7 +1706,7 @@ class UB:
                     more = "lanjut otomatis sebentar lagi" if posts is None else "tekan lagi untuk melanjutkan"
                     lines.append(f"@{ch['username']}: terhenti ({short(e)}), {more}")
             if total:
-                await self.backup_safe()
+                await self.backup_safe(force=True)
             if only is None and not resume:   # belajar satu channel tidak menunda jadwal belajar otomatis channel lain
                 await setv("learn_ts", int(time.time()))
             if had_err:
@@ -1273,16 +1727,23 @@ class UB:
         rows = await q("SELECT ch, kind, src, reply, ts FROM examples")
         if not rows:
             return 0
-        prog = await q("SELECT key, value FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%'")
+        prog = await q("SELECT key, value FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%' OR key LIKE 'learnrecent:%' OR key='learn_auto_paused'")
         payload = {"v": 1, "examples": rows, "progress": prog}
-        f = io.BytesIO(gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8")))
+        packed = await asyncio.to_thread(
+            lambda: gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        )   # data besar: jangan blokir event loop
+        f = io.BytesIO(packed)
         f.name = "menfess_belajar.json.gz"
         sent = await self.c.send_file("me", f, force_document=True,
                                       caption=f"{BACKUP_TAG} · {len(rows)} contoh · {fmt()}")
         await self.drop_backups(keep=sent.id)
+        self.last_backup = time.time()
         return len(rows)
 
-    async def backup_safe(self):
+    async def backup_safe(self, force=False):
+        """Backup aman: error ditelan. Tanpa force, dilewati bila backup terakhir kurang dari BACKUP_EVERY detik."""
+        if not force and time.time() - self.last_backup < BACKUP_EVERY:
+            return
         try:
             n = await self.backup()
             if n:
@@ -1307,37 +1768,41 @@ class UB:
                 break
         if target is None:
             return 0
-        if target.file and target.file.size and target.file.size > 30_000_000:
+        if target.id <= await count("backup_restored_id"):
+            return 0  # backup yang sama sudah pernah digabung; hindari unduh ulang setiap restart
+        if target.file and target.file.size and target.file.size > BACKUP_MAX_BYTES:
             raise ValueError("file backup terlalu besar")
         data = await self.c.download_media(target, file=bytes)
-        payload = json.loads(gzip.decompress(data).decode("utf-8"))
+        payload = await asyncio.to_thread(lambda: json.loads(gzip.decompress(data).decode("utf-8")))
         added = 0
-        for r in payload.get("examples", []):
-            try:
-                cur = await db.execute(
-                    "INSERT OR IGNORE INTO examples(ch, kind, src, reply, ts) VALUES(?, ?, ?, ?, ?)",
-                    (str(r["ch"]), str(r["kind"]), str(r["src"]), str(r["reply"]), int(r.get("ts") or 0)),
-                )
-                added += max(cur.rowcount, 0)
-            except (KeyError, TypeError, ValueError):
-                continue
-        for p in payload.get("progress", []):
-            try:
-                await db.execute("INSERT OR IGNORE INTO counters(key, value) VALUES(?, ?)",
-                                 (str(p["key"]), int(p["value"])))
-            except (KeyError, TypeError, ValueError):
-                continue
-        await db.commit()
+        async with DB_LOCK:
+            for r in payload.get("examples", []):
+                try:
+                    cur = await db.execute(
+                        "INSERT OR IGNORE INTO examples(ch, kind, src, reply, ts) VALUES(?, ?, ?, ?, ?)",
+                        (str(r["ch"]), str(r["kind"]), str(r["src"]), str(r["reply"]), int(r.get("ts") or 0)),
+                    )
+                    added += max(cur.rowcount, 0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for p in payload.get("progress", []):
+                try:
+                    await db.execute("INSERT OR IGNORE INTO counters(key, value) VALUES(?, ?)",
+                                     (str(p["key"]), int(p["value"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            await db.commit()
+        EXAMPLE_CACHE.clear()
+        await x(SETCNT, ("backup_restored_id", target.id))
         return added
 
     async def auto_restore(self):
         """Kalau database baru/kosong (misalnya server berganti), pulihkan hasil belajar dari backup."""
         try:
-            if (await q("SELECT COUNT(*) AS n FROM examples"))[0]["n"] == 0:
-                n = await self.restore()
-                if n:
-                    await log_("INFO", f"Hasil belajar dipulihkan dari backup: {n} contoh")
-                    await notify(f"♻️ Hasil belajar dipulihkan dari backup: {n} contoh.\n🕒 {fmt()}")
+            n = await self.restore()  # INSERT OR IGNORE; aman digabung dengan dataset JSON lokal
+            if n:
+                await log_("INFO", f"Hasil belajar dipulihkan dari backup: {n} contoh")
+                await notify(f"♻️ Hasil belajar dipulihkan dari backup: {n} contoh.\n🕒 {fmt()}")
         except Exception as e:
             await log_("ERROR", f"Pulihkan backup gagal: {short(e)}")
 
@@ -1358,19 +1823,29 @@ class UB:
         if (await user(uid))["lst"] == "black":
             return await skip("pengirim ada di blacklist")
         text = (msg.message or "").strip()
-        if len(text) < 2:
-            return await skip("reply terlalu pendek")
+        image = None
+        if getattr(msg, "photo", None):
+            if not text:
+                text = "(mengirim foto)"
+            try:
+                data = await self.c.download_media(msg, file=bytes)
+                if data and len(data) <= 4_000_000:
+                    image = data
+            except Exception as e:
+                log.warning("Foto reply gagal diunduh: %s", short(e))
+        elif getattr(msg, "sticker", None) and not text:
+            text = "(mengirim stiker)"
+        elif getattr(msg, "video", None) and not text:
+            text = "(mengirim video; isi video tidak terlihat)"
+        elif (getattr(msg, "voice", None) or getattr(msg, "audio", None)) and not text:
+            text = "(mengirim audio/pesan suara; audio belum ditranskripsikan)"
+        if not text:
+            return await skip("pesan tidak berisi teks atau media yang didukung")
         thread = f"t:{msg.chat_id}:{root.id}"
-        closed = f"closed:{thread}:{uid}"
-        if await count(closed):
-            return await skip("percakapan sudah ditutup")
-        if CLOSING.match(text):
-            await incr(closed)
-            return await skip("pesan penutup")
         day = f"day:{uid}:{now_wib():%Y%m%d}"
-        if await count(f"n:{thread}") >= s["max_thread"]:
+        if s["max_thread"] > 0 and await count(f"n:{thread}") >= s["max_thread"]:
             return await skip("batas balasan per thread tercapai")
-        if await count(day) >= s["max_user_day"]:
+        if s["max_user_day"] > 0 and await count(day) >= s["max_user_day"]:
             return await skip("batas balasan per user tercapai")
         if random.uniform(0, 100) > s["thread_prob"]:
             return await skip("reply kena peluang balas")
@@ -1383,7 +1858,7 @@ class UB:
         chrow = self.by_disc.get(msg.chat_id)
         extra = await examples_block(chrow["username"], "reply", text, s) if chrow else ""
         async with AI_SEM:
-            reply = await ask_ai("reply", msgs, s, extra=extra)
+            reply = await ask_ai("reply", msgs, s, image=image, extra=extra)
         if is_skip(reply):
             return await skip("AI memilih SKIP")
         async with SEND_LOCK:
@@ -1397,9 +1872,23 @@ class UB:
         await stat("reply")
 
     # ----- C. DM -----
+    async def mark_manual_dm_reply(self, ev):
+        """Kalau owner membalas manual, tandai antrean sebelum pesan itu sebagai sudah terjawab."""
+        chat_id = int(ev.chat_id)
+        msg = ev.message
+        if not msg:
+            return
+        # Pesan yang baru dikirim oleh fungsi bot sendiri tidak dihitung sebagai takeover manual.
+        if time.time() - self.ai_at.get(chat_id, 0) < 8:
+            return
+        await x(
+            "UPDATE dm_queue SET status='done', error='owner sudah membalas manual', next_try=0 "
+            "WHERE chat_id=? AND msg_id<? AND status IN ('pending','processing')",
+            (chat_id, int(msg.id)),
+        )
+
     async def peer_of(self, ev):
-        """Tujuan kirim yang pasti valid. Id angka saja bisa gagal ("Could not find the input entity")
-        kalau access_hash user belum tersimpan di session; entity dari event selalu lengkap."""
+        """Ambil InputPeer dari event supaya pengiriman tidak bergantung pada ID tanpa access_hash."""
         for getter in (ev.get_input_chat, ev.get_input_sender):
             try:
                 peer = await getter()
@@ -1408,9 +1897,9 @@ class UB:
             except Exception:
                 pass
         try:
-            return await self.c.get_input_entity(ev.sender_id)
+            return await self.c.get_input_entity(ev.chat_id)
         except Exception:
-            return ev.sender_id
+            return ev.chat_id
 
     def dm_lock(self, uid):
         lock = self.dm_locks.get(uid)
@@ -1418,65 +1907,336 @@ class UB:
             lock = self.dm_locks[uid] = asyncio.Lock()
         return lock
 
-    async def say(self, chat, text, peer=None):
-        self.ai_at[chat] = time.time()  # dicatat sebelum kirim supaya tidak dianggap takeover
-        await self.c.send_message(peer or chat, text)
-
-    async def dm(self, ev):
-        uid = ev.sender_id
-        if not uid or uid == self.me.id:
-            return
-        text = (ev.raw_text or "").strip()
-        peer = await self.peer_of(ev)
-        if text.lower() == "/stop":
-            await user_set(uid, stopped=1)
-            return await self.say(uid, "Balasan otomatis dihentikan. Ketik /start untuk mengaktifkan lagi.", peer)
-        if text.lower() == "/start":
-            await user_set(uid, stopped=0, greeted=1)
-            return await self.say(uid, DISCLOSURE, peer)
-
-        s = await settings()
-        try:
-            if is_ignored(await ev.get_sender(), s):
+    async def say(self, chat, text, peer=None, reply_to=None):
+        """Kirim pesan dengan retry FloodWait/slow mode."""
+        for attempt in range(6):
+            try:
+                self.ai_at[chat] = time.time()
+                await self.c.send_message(peer or chat, text, reply_to=reply_to)
                 return
-        except Exception:
-            pass
-        u = await user(uid)
-        if not s["dm_on"] or not text:
-            return
-        if u["lst"] == "black" or u["stopped"] or not u["ai_on"]:
-            return
-        if s["dm_whitelist"] and u["lst"] != "white":
-            return
-        hk = f"dm:{uid}:{now_wib():%Y%m%d%H}"
-        if s["dm_hour"] > 0 and await count(hk) >= s["dm_hour"]:
-            return await skip("batas DM per jam tercapai")
-        if not u["greeted"]:
-            await self.say(uid, DISCLOSURE, peer)
-            await user_set(uid, greeted=1)
+            except (errors.FloodWaitError, errors.SlowModeWaitError) as e:
+                wait = getattr(e, "seconds", 30)
+                if attempt >= 5 or wait > 3600:
+                    raise
+                await asyncio.sleep(wait + 1)
 
-        key = f"dm:{uid}"
-        async with self.dm_lock(uid):   # satu percakapan diproses berurutan
-            await hist_add(key, "user", text)
-            await humanize(s)
-            async with AI_SEM:
-                reply = await ask_ai("dm", await hist_get(key, 12), s)
-            if is_skip(reply):
-                return await skip("AI memilih SKIP")
-            bubbles = split_bubbles(reply)
-            if not bubbles:
-                return await skip("balasan AI kosong")
-            for i, part in enumerate(bubbles):
-                if i:
-                    await asyncio.sleep(random.uniform(0.4, 1.2))   # jeda antar bubble seperti orang mengetik
+    async def enqueue_dm(self, ev):
+        """Masukkan DM realtime ke SQLite; balasan dilakukan worker agar pesan tidak hilang saat error."""
+        msg = ev.message
+        if not msg or getattr(msg, "out", False) or not ev.is_private:
+            return
+        chat_id = int(ev.chat_id)
+        if chat_id == self.me.id or not msg.sender_id or msg.sender_id == self.me.id:
+            return
+        peer = await self.peer_of(ev)
+        self.dm_peers[chat_id] = peer
+        await self.queue_dm_message(chat_id, msg)
+
+    async def queue_dm_message(self, chat_id, msg, legacy=False):
+        if not msg or getattr(msg, "out", False) or msg.sender_id == self.me.id:
+            return
+        created = int(msg.date.timestamp()) if getattr(msg, "date", None) else int(time.time())
+        async with DB_LOCK:
+            await db.execute(
+                "INSERT OR IGNORE INTO dm_queue(chat_id, msg_id, created_ts, legacy) VALUES(?, ?, ?, ?)",
+                (int(chat_id), int(msg.id), created, int(bool(legacy))),
+            )
+            await db.commit()
+
+    async def dm_reconcile_loop(self):
+        """Sapukan dialog DM berkala untuk mengambil pesan yang event realtime-nya terlewat."""
+        await asyncio.sleep(1)
+        first_pass = True
+        while self.ready:
+            try:
+                await self.dm_catchup()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await log_("ERROR", f"Pemeriksaan DM tertinggal gagal: {short(e)}")
+                await report("⚠️ Pemeriksaan DM tertinggal gagal", esc(short(e)), key="dm_catchup", every=300)
+            finally:
+                if first_pass:
+                    self.dm_initializing = False
+                    first_pass = False
+            await asyncio.sleep(DM_RESCAN_SEC)
+
+    async def dm_catchup(self):
+        """Pindai DM tertinggal dan antrekan hanya pesan masuk yang belum diikuti balasan keluar.
+
+        Pemindaian pertama membaca seluruh riwayat DM yang tersedia. Pada pemindaian berikutnya,
+        cursor per percakapan membatasi bacaan ke pesan baru. Pesan masuk yang diikuti pesan keluar
+        dianggap sudah dijawab (oleh bot atau owner), sehingga tidak dibalas dua kali.
+        """
+        if not self.ready or self.dm_scan_lock.locked():
+            return
+        async with self.dm_scan_lock:
+            had_error = False
+            dialogs = [d async for d in self.c.iter_dialogs(limit=None)]
+            user_dialogs = [
+                d for d in dialogs
+                if getattr(d, "is_user", False)
+                and int(d.id) != self.me.id
+                and not getattr(d.entity, "bot", False)
+            ]
+            # Kunci semua chat lebih dulu agar worker tidak membalas pesan historis
+            # sebelum pemeriksaan pesan keluar selesai dilakukan.
+            self.dm_scanning_chats.update(int(d.id) for d in user_dialogs)
+            for dialog in user_dialogs:
+                entity = dialog.entity
+                chat_id = int(dialog.id)
+                self.dm_peers[chat_id] = entity
+                try:
+                    cursor_rows = await q("SELECT last_id FROM dm_cursor WHERE chat_id=?", (chat_id,))
+                    last_id = int(cursor_rows[0]["last_id"]) if cursor_rows else 0
+                    kwargs = {"limit": None, "reverse": True}
+                    if last_id:
+                        kwargs["min_id"] = last_id
+                    max_seen = last_id
+                    async for msg in self.c.iter_messages(entity, **kwargs):
+                        msg_id = int(msg.id)
+                        max_seen = max(max_seen, msg_id)
+                        if getattr(msg, "out", False):
+                            # Jangan salah menganggap bubble AI yang baru dikirim sebagai balasan manual;
+                            # proses DM sendiri akan menyelesaikan antreannya setelah semua bubble terkirim.
+                            if time.time() - self.ai_at.get(chat_id, 0) >= 8:
+                                # Pesan keluar setelah pesan masuk berarti percakapan sudah mendapat balasan.
+                                async with DB_LOCK:
+                                    await db.execute(
+                                        "UPDATE dm_queue SET status='done', error='sudah mendapat pesan keluar setelahnya', "
+                                        "next_try=0 WHERE chat_id=? AND msg_id<? AND status IN ('pending','processing')",
+                                        (chat_id, msg_id),
+                                    )
+                                    await db.commit()
+                        elif msg.sender_id not in (None, self.me.id):
+                            if (DM_CATCHUP_MAX_HOURS > 0 and msg.date
+                                    and time.time() - msg.date.timestamp() > DM_CATCHUP_MAX_HOURS * 3600):
+                                continue   # terlalu lama: membalas sekarang akan terlihat aneh
+                            await self.queue_dm_message(chat_id, msg)
+                    if max_seen:
+                        await x(
+                            "INSERT INTO dm_cursor(chat_id, last_id) VALUES(?, ?) "
+                            "ON CONFLICT(chat_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
+                            (chat_id, max_seen),
+                        )
+                except errors.FloodWaitError as e:
+                    had_error = True
+                    await asyncio.sleep(min(e.seconds + 1, 180))
+                except Exception as e:
+                    had_error = True
+                    await log_("ERROR", f"Sapuan DM {chat_id} gagal: {short(e)}")
+                finally:
+                    self.dm_scanning_chats.discard(chat_id)
+            if not had_error:
+                await setv("dm_last_scan_ts", int(time.time()))
+
+    async def dm_queue_loop(self):
+        """Worker DM persisten. Error AI/jaringan dijadwalkan ulang tanpa membunuh worker."""
+        while self.ready:
+            try:
+                if self.dm_initializing:
+                    await asyncio.sleep(1.5)
+                    continue
+                rows = await q(
+                    "SELECT q.* FROM dm_queue q "
+                    "WHERE q.status='pending' AND q.next_try<=? "
+                    "AND NOT EXISTS (SELECT 1 FROM dm_queue p WHERE p.chat_id=q.chat_id "
+                    "AND p.msg_id<q.msg_id AND p.status IN ('pending','processing')) "
+                    "ORDER BY q.created_ts, q.chat_id, q.msg_id LIMIT 20",
+                    (int(time.time()),),
+                )
+                for row in rows:
+                    chat_id = row["chat_id"]
+                    if chat_id in self.dm_active_chats or chat_id in self.dm_scanning_chats:
+                        continue
+                    async with DB_LOCK:
+                        cur = await db.execute(
+                            "UPDATE dm_queue SET status='processing' WHERE chat_id=? AND msg_id=? AND status='pending'",
+                            (chat_id, row["msg_id"]),
+                        )
+                        await db.commit()
+                    if cur.rowcount:
+                        self.dm_active_chats.add(chat_id)
+                        self.spawn(self.process_dm_queue_item(row))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("DM queue worker error: %s", short(e))
+            await asyncio.sleep(1.5)
+
+    async def finish_dm_queue(self, chat_id, msg_id, error=""):
+        await x("UPDATE dm_queue SET status='done', error=? WHERE chat_id=? AND msg_id=?",
+                (error[:300], chat_id, msg_id))
+
+    async def process_dm_queue_item(self, row):
+        chat_id, msg_id = row["chat_id"], row["msg_id"]
+        try:
+            peer = self.dm_peers.get(chat_id)
+            if peer is None:
+                peer = await self.c.get_input_entity(chat_id)
+                self.dm_peers[chat_id] = peer
+            msg = await self.c.get_messages(peer, ids=msg_id)
+            if msg is None or getattr(msg, "out", False) or msg.sender_id in (None, self.me.id):
+                await self.finish_dm_queue(chat_id, msg_id, "pesan sudah tidak tersedia atau bukan DM masuk")
+                return
+            await self.process_dm_message(msg, peer)
+        except asyncio.CancelledError:
+            try:
+                await x("UPDATE dm_queue SET status='pending', next_try=0 WHERE chat_id=? AND msg_id=?",
+                        (chat_id, msg_id))
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            fresh = await q("SELECT attempts FROM dm_queue WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+            attempts = (fresh[0]["attempts"] if fresh else 0) + 1
+            delay = min(15 * (2 ** min(attempts - 1, 6)), 900)
+            await x(
+                "UPDATE dm_queue SET status='pending', attempts=?, next_try=?, error=? "
+                "WHERE chat_id=? AND msg_id=?",
+                (attempts, int(time.time()) + delay, short(e), chat_id, msg_id),
+            )
+            await report(
+                "⚠️ DM belum berhasil dibalas",
+                f"👤 Chat: <code>{chat_id}</code> · pesan #{msg_id}\n"
+                f"❓ {esc(short(e))}\n🔁 Akan dicoba lagi otomatis dalam {delay} detik.",
+                key=f"dm_retry:{chat_id}", every=120,
+            )
+        finally:
+            self.dm_active_chats.discard(chat_id)
+
+    async def process_dm_message(self, msg, peer):
+        """Balas satu DM dari antrean. Hasil dan posisi bubble disimpan agar retry tidak menggandakan."""
+        uid = int(msg.sender_id)
+        msg_id = int(msg.id)
+        chat_id = int(msg.chat_id or uid)
+        async with self.dm_lock(chat_id):
+            queued = await q("SELECT * FROM dm_queue WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+            if not queued or queued[0]["status"] == "done":
+                return
+            row = queued[0]
+            text = (msg.raw_text or "").strip()
+            image = None
+            media_note = ""
+            if getattr(msg, "photo", None):
+                media_note = "Pengguna mengirim foto."
+                try:
+                    data = await self.c.download_media(msg, file=bytes)
+                    if data and len(data) <= 4_000_000:
+                        image = data
+                    elif data:
+                        media_note += " Ukuran foto terlalu besar untuk dikirim ke model."
+                except Exception as e:
+                    log.warning("Foto DM gagal diunduh: %s", short(e))
+            elif getattr(msg, "sticker", None):
+                media_note = "Pengguna mengirim stiker."
+            elif getattr(msg, "video", None):
+                media_note = "Pengguna mengirim video; isi video tidak dapat dianalisis."
+            elif getattr(msg, "voice", None) or getattr(msg, "audio", None):
+                media_note = "Pengguna mengirim audio/pesan suara; audio belum ditranskripsikan."
+            elif getattr(msg, "media", None):
+                media_note = "Pengguna mengirim media atau jenis pesan yang belum bisa dibaca isinya."
+            if not text and not media_note:
+                if getattr(msg, "action", None):
+                    await self.finish_dm_queue(chat_id, msg_id, "aksi layanan Telegram, bukan pesan chat")
+                    return
+                await self.finish_dm_queue(chat_id, msg_id, "pesan kosong/tidak didukung")
+                return
+            if not text:
+                text = media_note
+            elif media_note:
+                text = text + "\n" + media_note
+
+            s = await settings()
+            try:
+                sender = await msg.get_sender()
+            except Exception:
+                sender = None
+            if sender is not None and is_ignored(sender, s):
+                await self.finish_dm_queue(chat_id, msg_id, "pengirim diabaikan")
+                return
+
+            if text.lower() == "/stop":
+                await user_set(uid, stopped=1)
+                await self.say(uid, "Balasan otomatis dihentikan. Ketik /start untuk mengaktifkan lagi.", peer)
+                await self.finish_dm_queue(chat_id, msg_id)
+                return
+            if text.lower() == "/start":
+                await user_set(uid, stopped=0, greeted=1, ai_on=1)
+                await self.say(uid, DISCLOSURE, peer)
+                await self.finish_dm_queue(chat_id, msg_id)
+                return
+
+            u = await user(uid)
+            if (not s["dm_on"] or u["lst"] == "black" or u["stopped"] or not u["ai_on"]
+                    or (s["dm_whitelist"] and u["lst"] != "white")):
+                await self.finish_dm_queue(chat_id, msg_id, "DM nonaktif/blacklist/opt-out/di luar whitelist")
+                return
+            if not u["greeted"]:
+                await self.say(uid, DISCLOSURE, peer)
+                await user_set(uid, greeted=1)
+
+            key = f"dm:{uid}"
+            # Jika pernah berhasil membuat balasan sebelum terputus, pakai balasan tersimpan.
+            if row["reply"]:
+                bubbles = json.loads(row["reply"])
+            else:
+                context = await hist_get(key, 12)
+                context.append({"role": "user", "content": text[:4000]})
+                await humanize(s)
+                extra = await examples_block(DM_EXAMPLE_CH, "reply", text, s, n=5)
+                async with AI_SEM:
+                    reply = await ask_ai("dm", context, s, image=image, extra=extra)
+                if is_skip(reply):
+                    # DM tidak boleh dibiarkan tanpa jawaban hanya karena AI ragu atau bingung.
+                    reply = "aku belum nangkep maksudnya, boleh jelasin sedikit lagi?"
+                bubbles = split_bubbles(reply)
+                if not bubbles:
+                    raise RuntimeError("AI mengembalikan balasan DM kosong")
+                await x(
+                    "UPDATE dm_queue SET reply=?, sent_count=0 WHERE chat_id=? AND msg_id=?",
+                    (json.dumps(bubbles, ensure_ascii=False), chat_id, msg_id),
+                )
+                row["sent_count"] = 0
+
+            sent_count = int(row["sent_count"] or 0)
+            for i in range(sent_count, len(bubbles)):
+                fresh = await q("SELECT status FROM dm_queue WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+                if not fresh or fresh[0]["status"] == "done":
+                    return
+                part = bubbles[i]
+                if i > sent_count:
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                 await self.typing(peer, min(0.8 + len(part) * 0.03, 3))
+                # Periksa sekali lagi setelah typing, karena balasan manual mungkin masuk saat menunggu.
+                fresh = await q("SELECT status FROM dm_queue WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+                if not fresh or fresh[0]["status"] == "done":
+                    return
                 await self.say(uid, part, peer)
-            await hist_add(key, "assistant", "\n".join(bubbles))
-            await incr(hk)
+                await x(
+                    "UPDATE dm_queue SET sent_count=? WHERE chat_id=? AND msg_id=?",
+                    (i + 1, chat_id, msg_id),
+                )
+
+            # Simpan history dan status selesai dalam satu transaksi agar retry tidak menggandakan konteks.
+            # sqlite3 membuka transaksi implisit pada INSERT pertama; DB_LOCK menjamin ketiganya atomik.
+            async with DB_LOCK:
+                await db.execute("INSERT INTO hist(key, role, content) VALUES(?, ?, ?)", (key, "user", text[:2000]))
+                await db.execute("INSERT INTO hist(key, role, content) VALUES(?, ?, ?)",
+                                 (key, "assistant", "\n".join(bubbles)[:2000]))
+                await db.execute(
+                    "UPDATE dm_queue SET status='done', error='', next_try=0 WHERE chat_id=? AND msg_id=?",
+                    (chat_id, msg_id),
+                )
+                await db.commit()
             await stat("dm")
 
+
     async def takeover(self, ev):
-        """Kalau kamu mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
+        """Pengambilalihan manual hanya aktif bila diizinkan di panel."""
+        s = await settings()
+        if not s.get("manual_takeover", False):
+            return
         uid = ev.chat_id
         if time.time() - self.ai_at.get(uid, 0) < 10:
             return
@@ -1602,7 +2362,7 @@ async def scr_home(_=""):
     s = await settings()
     chans = await q("SELECT paused FROM channels")
     st = await stats()
-    total = st.get("comment", 0) + st.get("reply", 0) + st.get("dm", 0)
+    total = st.get("comment", 0) + st.get("reply", 0) + st.get("dm", 0) + st.get("group", 0)
     online = bool(ub and ub.ready)
     active = sum(1 for c in chans if not c["paused"])
     if LAST:
@@ -1632,7 +2392,7 @@ async def scr_help(_=""):
         "<b>❓ Bantuan</b>\n\n"
         "📡 <b>Channel</b>: channel menfess yang dipantau bot.\n\n"
         "🤖 <b>Pengaturan AI</b>: gaya, panjang jawaban, provider AI, dan <b>Belajar dari Channel</b> "
-        "(bot meniru balasan asli di channel dan membaca foto).\n\n"
+        "(bot meniru balasan asli di channel dan membaca foto). Asisten grup hanya menjawab saat di-mention atau di-reply.\n\n"
         "💬 <b>Mode Chat</b>: bot boleh membalas apa saja (komentar, reply, DM) dan seberapa sering. "
         "Paling gampang: pilih <b>Profil Cepat</b>.\n\n"
         "📊 <b>Statistik</b>: jumlah balasan dan log terakhir.\n\n"
@@ -1755,25 +2515,39 @@ async def scr_learn(_=""):
     last = fmt_short(s["learn_ts"]) if s["learn_ts"] else "belum pernah"
     busy = f"\n⏳ Sedang belajar... {esc(ub.prog)}" if ub and ub.learning else ""
     pl = []
+    auto_paused = bool(await count("learn_auto_paused"))
     for c in await q("SELECT username, chat_id FROM channels ORDER BY username"):
         pos = await count(f"learnpos:{c['chat_id']}")
-        state = "✅ semua isi sudah dipelajari" if pos == -1 else f"lanjut dari post #{pos}" if pos > 0 else "belum dimulai"
+        recent = await count(f"learnrecent:{c['chat_id']}")
+        if pos == -1:
+            state = f"✅ arsip selesai · update terbaru sampai post #{recent}"
+        elif pos > 0:
+            state = f"arsip lanjut dari post #{pos} · update sampai #{recent}"
+        else:
+            state = f"update otomatis sampai post #{recent}" if recent else "belum dimulai"
         pl.append(f"• @{esc(c['username'])}: {state}")
     all_block = ("\n📖 <b>Belajar semua isi channel</b>\n" + "\n".join(pl) + "\n") if pl else ""
     text = (
         "<b>📚 Belajar dari Channel</b>\n\n"
-        "Bot membaca postingan dan komentar asli pengunjung, lalu memakainya sebagai contoh "
-        "supaya balasannya mirip gaya orang di channel itu (pendek/panjang, bahasa, candaan).\n\n"
+        "Bot membaca seluruh komentar dan balasan bertingkat pada setiap postingan (bukan hanya 100 komentar), "
+        "lalu memakainya sebagai contoh gaya. Akun bot dan nama yang diabaikan (default: Rose) tidak dipelajari.\n\n"
         f"💬 Contoh komentar menfess : <b>{cnt.get('menfess', 0)}</b>\n"
         f"↩️ Contoh balasan reply : <b>{cnt.get('reply', 0)}</b>\n"
         f"🕒 Terakhir belajar : {last}{busy}\n"
+        f"🔁 Belajar otomatis : {'⚪ nonaktif' if not s['learn_on'] else '⏸ dijeda' if auto_paused else '🟢 aktif tiap 5 menit'}\n"
         f"🚫 Diabaikan : semua akun bot + {esc(', '.join(s['ignore_names']) or '-')}\n"
         f"{all_block}\n"
-        "<i>Yang disimpan hanya teks. Nama, ID, link, dan @mention dibuang. Bot juga belajar otomatis "
-        "tiap 12 jam. Foto dibaca lewat Gemini.\n"
+        "<i>Yang disimpan hanya isi teks komentar (nama/ID tidak disimpan; link dan @mention dibersihkan). "
+        "Bot belajar otomatis setiap 5 menit. Tiap thread dibaca sampai seluruh halaman komentar habis. "
+        "Foto menfess dibaca lewat Gemini.\n"
         "💾 Hasil belajar di-backup ke Pesan Tersimpan akun userbot dan dipulihkan sendiri kalau data hilang. "
-        "Belajar semua isi lanjut otomatis kalau bot restart atau error, dan baru berhenti kalau sudah selesai "
-        "atau kamu tekan Hentikan.</i>"
+        "Belajar semua isi lanjut otomatis kalau bot restart atau error. Setelah itu, pembelajaran incremental "
+        "terus berjalan tiap 5 menit selama userbot online, kecuali kamu tekan Hentikan.\n"
+        "Komentar yang baru masuk dipelajari realtime dan disapu lagi dari grup diskusi tiap 30 detik "
+        "(maksimal 250 pesan baru per channel per siklus) agar komentar yang terlewat dapat dipulihkan.\n"
+        "DM masuk disimpan di antrean SQLite. Saat pertama dipasang, bot menyapu seluruh riwayat DM dan hanya "
+        "mengantrekan pesan masuk yang belum diikuti balasan keluar; berikutnya cursor dipakai untuk pesan baru. "
+        "Error sementara dicoba ulang otomatis tanpa batas.</i>"
     )
     rows = [
         [B(f"{on(s['learn_on'])} Pakai contoh asli", "tog", "learn_on"),
@@ -1834,6 +2608,8 @@ async def scr_chat(_=""):
          B(f"{on(s['reply_on'])} Balas reply", "tog", "reply_on")],
         [B(f"{on(s['dm_on'])} Balas DM", "tog", "dm_on"),
          B(f"{on(s['dm_whitelist'])} DM khusus whitelist", "tog", "dm_whitelist")],
+        [B(f"{on(s['group_on'])} Asisten Grup (mention/reply)", "tog", "group_on")],
+        [B(f"{on(s['manual_takeover'])} Ambil alih manual", "tog", "manual_takeover")],
         [B("🎛 Profil Cepat", "prof"), B("🔧 Pengaturan Detail", "detail")],
         [B("🔑 Filter Kata", "kw"), B("🚫 Kata Terlarang", "ban")],
         [B("👥 Kelola DM", "dm")],
@@ -1907,7 +2683,8 @@ async def scr_ban(_=""):
 
 async def scr_dm(_=""):
     users = await q("SELECT * FROM users WHERE lst IS NOT NULL OR ai_on=0 OR stopped=1 ORDER BY uid DESC LIMIT 20")
-    rows = [[B("✅ Tambah Whitelist", "in", "white"), B("🚫 Tambah Blacklist", "in", "black")]]
+    rows = [[B("✅ Tambah Whitelist", "in", "white"), B("🚫 Tambah Blacklist", "in", "black")],
+            [B("♻️ Aktifkan AI semua (kecuali /stop & blacklist)", "dmallon")]]
     rows += [[B(f"👤 {u['uid']} · {user_tag(u)}", "duser", str(u["uid"]))] for u in users]
     return "<b>👥 Kelola DM</b>\n\nWhitelist, blacklist, dan AI yang dimatikan.", rows + back("chat")
 
@@ -1935,6 +2712,7 @@ async def scr_stats(_=""):
         f"💬 Komentar menfess : <b>{st.get('comment', 0)}</b>\n"
         f"↩️ Balasan reply : <b>{st.get('reply', 0)}</b>\n"
         f"📩 Balasan DM : <b>{st.get('dm', 0)}</b>\n"
+        f"👥 Asisten grup : <b>{st.get('group', 0)}</b>\n"
         f"⏭ Dilewati : <b>{st.get('skipped', 0)}</b>\n"
         f"❌ Error : <b>{st.get('error', 0)}</b>\n\n"
         f"<b>Log terakhir (WIB)</b>\n{log_text}"
@@ -2080,10 +2858,33 @@ panel.message.filter(F.from_user.id == OWNER_ID)
 panel.callback_query.filter(F.from_user.id == OWNER_ID)
 
 
+TAG_RE = re.compile(r"<(/?)(b|i|u|s|code|pre|a)\b[^>]*>", re.I)
+
+
+def clip_html(text, limit=4000):
+    """Potong teks HTML ke batas Telegram dan tutup tag yang masih terbuka supaya tidak error parse."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    nl = cut.rfind("\n")
+    if nl > limit * 0.6:
+        cut = cut[:nl]
+    cut = re.sub(r"<[^>]*$", "", cut)   # buang tag yang terpotong di tengah
+    stack = []
+    for m in TAG_RE.finditer(cut):
+        if m.group(1):
+            if stack and stack[-1] == m.group(2).lower():
+                stack.pop()
+        else:
+            stack.append(m.group(2).lower())
+    return cut + "\n…" + "".join(f"</{t}>" for t in reversed(stack))
+
+
 async def show(text, rows, notice=None):
     """Edit satu pesan panel. Kalau belum ada atau sudah hilang, kirim yang baru."""
     if notice:
         text = f"<i>{esc(notice)}</i>\n\n{text}"
+    text = clip_html(text)
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     if PANEL["mid"]:
         try:
@@ -2204,8 +3005,10 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
         return await show_cb(cq, text, rows, notice)
     if a == "learnstop":
         await x("UPDATE counters SET value=0 WHERE key LIKE 'learnfull:%'")   # matikan lanjut otomatis
-        if ub and ub.learning:
+        await x(SETCNT, ("learn_auto_paused", 1))
+        if ub:
             ub.learn_stop = True
+        if ub and ub.learning:
             notice = "Menghentikan... progres tersimpan. Belajar tidak lanjut otomatis sampai kamu mulai lagi."
         else:
             notice = "Bot sedang tidak belajar. Lanjut otomatis dimatikan."
@@ -2227,7 +3030,11 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
                 notice = f"Gagal: {explain(e)}"
         text, rows = await render("learn")
         return await show(text, rows, notice)
-    if a == "tog":
+    if a == "dmallon":
+        await x("UPDATE users SET ai_on=1 WHERE stopped=0 AND (lst IS NULL OR lst!='black')")
+        to, arg = "dm", ""
+        notice = "AI diaktifkan kembali untuk pengguna yang tidak /stop dan tidak di-blacklist."
+    elif a == "tog":
         s = await settings()
         await setv(b, not s[b])
         to, arg = ("sys" if b in ("notify", "notify_ok") else "learn" if b in ("learn_on", "vision_on") else "chat"), ""
@@ -2303,7 +3110,8 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
             to = "sys"
         elif action == "cex":
             await x("DELETE FROM examples")
-            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%'")
+            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%' OR key LIKE 'learnrecent:%'")
+            EXAMPLE_CACHE.clear()   # kalau tidak, contoh lama masih dipakai AI sampai 5 menit
             if ub and ub.ready:
                 try:
                     await ub.drop_backups()
@@ -2358,8 +3166,8 @@ async def in_channel(msg: Message, state: FSMContext):
             if ub.learning:
                 notice += " Bot sedang belajar channel lain, belajar channel ini bisa dimulai dari menu Channel setelah selesai."
             else:
-                ub.spawn(ub.learn_all(100, who=True, only=info["username"]))
-                notice += " Bot juga mulai belajar gaya komentar di channel ini (100 post terakhir)."
+                ub.spawn(ub.learn_all(None, who=True, only=info["username"]))
+                notice += " Bot mulai mempelajari seluruh arsip postingan beserta semua komentarnya. Proses bisa berlanjut otomatis setelah restart."
         except Exception as e:
             notice = f"Gagal: {explain(e)}"
     text, rows = await render("chan")
@@ -2453,6 +3261,8 @@ async def in_sessfile(msg: Message, state: FSMContext):
                 member = next((n for n in zf.namelist() if n.lower().endswith(".session")), None)
                 if not member:
                     raise ValueError("zip tidak berisi file .session")
+                if zf.getinfo(member).file_size > 5 * 1024 * 1024:
+                    raise ValueError("isi zip terlalu besar")
                 data = zf.read(member)
         else:
             with open(raw, "rb") as f:
@@ -2530,9 +3340,13 @@ async def in_pwd(msg: Message, state: FSMContext):
         return await show_result("Sesi login tidak ditemukan. Mulai lagi dari menu Session.")
     try:
         await c.sign_in(password=pwd)
-    except Exception:
+    except errors.PasswordHashInvalidError:
         text, rows = input_screen("pwd")
         return await show(text, rows, "Password salah. Coba lagi.")
+    except Exception as e:
+        await state.clear()
+        await login_close()
+        return await show_result(f"Login gagal: {short(e)}")
     await state.clear()
     string = c.session.save()
     me = await c.get_me()
@@ -2573,6 +3387,14 @@ async def startup_check():
 async def run_bot():
     global bot, ub
     await db_init()
+    # Versi lama bisa mematikan AI DM otomatis saat owner mengirim pesan manual.
+    # Pulihkan sekali untuk semua user yang tidak pernah mengetik /stop dan tidak di-blacklist.
+    if not await count("dm_auto_resume_v1"):
+        await x("UPDATE users SET ai_on=1 WHERE COALESCE(stopped, 0)=0 AND (lst IS NULL OR lst!='black')")
+        await x(SETCNT, ("dm_auto_resume_v1", 1))
+    imported = await import_learning_dataset()
+    if imported:
+        log.info("Dataset lokal berhasil ditambahkan: %s contoh", imported)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     s = await settings()
     ub = UB(s.get("session") or SESSION)
@@ -2587,7 +3409,8 @@ async def run_bot():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(panel)
     if ub.ready:
-        await notify(f"✅ <b>Bot dan userbot aktif</b>\n🕒 {fmt()}\n👤 {esc(ub.me.first_name or '-')}")
+        dataset_note = f"\n📚 Dataset lokal: {imported} contoh baru" if imported else ""
+        await notify(f"✅ <b>Bot dan userbot aktif</b>\n🕒 {fmt()}\n👤 {esc(ub.me.first_name or '-')}{dataset_note}")
         task = asyncio.create_task(startup_check())
         BG.add(task)
         task.add_done_callback(BG.discard)
