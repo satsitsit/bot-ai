@@ -107,19 +107,19 @@ NUMS = {
     "max_age_min": ("Abaikan postingan lebih tua dari (menit)", 5, 1440, 5, [15, 30, 60, 180]),
     "max_thread": ("Maks balasan per thread", 1, 20, 1, [1, 2, 3, 5]),
     "max_user_day": ("Maks balasan per orang per hari", 1, 100, 1, [3, 5, 10, 20]),
-    "dm_hour": ("Maks balasan DM per jam", 1, 200, 5, [10, 20, 50, 100]),
+    "dm_hour": ("Maks balasan DM per jam per orang (0 = bebas)", 0, 200, 5, [0, 10, 20, 50]),
 }
 # profil cepat: sekali tekan mengatur banyak angka sekaligus
 PROFILES = {
     "hemat": ("🐢 Hemat Kuota", "Aman untuk AI gratis. Tidak semua dibalas, ada jeda, dan ada batas per jam.",
               dict(reply_prob=60, thread_prob=50, delay_min=3, delay_max=15, max_comment_hour=30,
-                   max_thread=2, max_user_day=5, dm_hour=10)),
+                   max_thread=2, max_user_day=5, dm_hour=0)),
     "normal": ("⚖️ Seimbang", "Hampir semua dibalas dengan jeda pendek. Batas 40 komentar per jam.",
                dict(reply_prob=100, thread_prob=70, delay_min=0, delay_max=3, max_comment_hour=40,
-                    max_thread=3, max_user_day=10, dm_hour=20)),
+                    max_thread=3, max_user_day=10, dm_hour=0)),
     "aktif": ("🚀 Aktif Penuh", "Semua dibalas secepat mungkin, tanpa batas per jam. Kuota gratis cepat habis.",
               dict(reply_prob=100, thread_prob=100, delay_min=0, delay_max=3, max_comment_hour=0,
-                   max_thread=5, max_user_day=20, dm_hour=50)),
+                   max_thread=5, max_user_day=20, dm_hour=0)),
 }
 HELP = {
     "reply_prob": "Dari 100 menfess yang masuk, berapa yang dibalas. 100 berarti semua dibalas.",
@@ -131,30 +131,35 @@ HELP = {
     "max_age_min": "Kalau bot sempat mati, postingan yang lebih tua dari ini tidak dibalas supaya tidak terlihat aneh.",
     "max_thread": "Berapa kali bot boleh membalas dalam satu menfess (satu thread).",
     "max_user_day": "Berapa kali bot boleh membalas satu orang yang sama dalam sehari.",
-    "dm_hour": "Batas balasan DM per jam untuk setiap orang.",
+    "dm_hour": "Batas balasan DM per jam untuk setiap orang. 0 berarti tanpa batas, AI membalas terus.",
 }
 DEFAULTS = {
     "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False,
     "notify": True, "notify_ok": False,
     "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 0, "delay_max": 3,
-    "max_comment_hour": 40, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
+    "max_comment_hour": 40, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 0,
     "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": ["openrouter"],
     "model_gemini": MODELS["gemini"][0],
     "model_groq": MODELS["groq"][0],
     "model_openrouter": MODELS["openrouter"][0],
     "persona": "teman", "style": "x", "reply_len": "auto", "prompt": "",
     "learn_on": True, "vision_on": True, "ignore_names": ["rose"], "learn_ts": 0,
-    "banned": [],
+    "banned": ["@"],
 }
-SETTINGS_VERSION = 10   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
+SETTINGS_VERSION = 12   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
 POLL_SEC = 10          # jeda cek berkala channel (cadangan kalau update realtime tidak masuk)
 SEND_GAP = 2.5         # jeda minimal antar komentar, mencegah FloodWait
 LEARN_EVERY = 12 * 3600  # jeda belajar otomatis dari channel
 MAX_EXAMPLES = 20000     # contoh tersimpan per channel (yang paling lama dibuang kalau penuh)
 BACKUP_TAG = "#menfess_backup"   # penanda file backup di Pesan Tersimpan akun userbot
 BACKUP_EVERY = 900       # detik: selama belajar lama, backup tiap 15 menit
+LEARN_PARALLEL = 4       # berapa postingan dipelajari bersamaan (makin besar makin cepat, tapi rawan FloodWait)
+LEARN_PAGE = 100         # postingan diambil per halaman
+LEARN_GAP = 0.3          # jeda singkat antar kelompok postingan
+SETCNT = "INSERT INTO counters(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
 DISCLOSURE = (
-    "Halo! 👋 Akun ini menggunakan asisten AI untuk membalas pesan secara otomatis.\n"
+    "Halo! 👋 Aku asisten AI-nya Newt (@sticksc), dibuat dan dikelola langsung oleh Newt.\n"
+    "Akun ini membalas pesan secara otomatis pakai AI.\n"
     "Ketik /stop kapan saja untuk menghentikan balasan otomatis."
 )
 CLOSING = re.compile(r"^\s*(ok|oke|okay|sip|makasih|mksh|thanks|thx|noted|siap|yoi)[\s!.]*$", re.I)
@@ -446,18 +451,43 @@ def is_skip(text):
     return text.strip().strip("\"'.").upper() == "SKIP"
 
 
+BUBBLE_SPLIT = re.compile(r"\s*\|{2,}\s*")
+
+
+def split_bubbles(text, limit=4):
+    """Pecah balasan AI jadi beberapa bubble chat (dipisah |||). Kalau AI lupa memakai pemisah
+    tapi menulis beberapa baris, tiap baris jadi satu bubble. Maksimal `limit` bubble."""
+    parts = [p.strip() for p in BUBBLE_SPLIT.split(text or "") if p.strip()]
+    if len(parts) == 1 and "\n" in parts[0]:
+        parts = [ln.strip() for ln in parts[0].split("\n") if ln.strip()]
+    if len(parts) > limit:
+        parts = parts[:limit - 1] + [" ".join(parts[limit - 1:])]
+    return parts
+
+
 def system_prompt(s, mode):
     persona = s["prompt"].strip() or PERSONAS[s["persona"]][1]
     rules = [
         f"Balas dalam Bahasa Indonesia seperti chat sungguhan. {LENGTHS[s['reply_len']][1]}",
         "Jika ditanya langsung, jujur bahwa kamu asisten AI. Jangan mengaku manusia.",
+        "Identitasmu: asisten AI milik Newt (@sticksc), diproduksi dan dikelola oleh Newt. "
+        "Kalau ada yang bertanya kamu siapa, asisten siapa, atau siapa yang membuatmu, jawab sesuai itu "
+        "dengan gaya bahasamu. Jangan menyebut identitas ini kalau tidak ditanya.",
         "Jangan menghina, memprovokasi, membahas SARA, konten seksual, atau kekerasan.",
         "Jangan meminta atau membagikan data pribadi.",
         "Jangan memaksakan percakapan.",
         "Keluarkan hanya teks balasan, tanpa label atau tanda kutip.",
     ]
-    if mode != "menfess":
-        rules.insert(4, "Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP")
+    if mode == "reply":
+        rules.insert(5, "Jika pesan spam, provokasi, atau tidak bermakna, jawab persis: SKIP")
+    if mode == "dm":
+        rules.insert(len(rules) - 1,
+                     "Ini chat pribadi, jadi balas seperti orang mengetik di WhatsApp: pecah balasan jadi 2 sampai 4 "
+                     "pesan pendek, satu ide per pesan, dan pisahkan antar pesan dengan tanda ||| "
+                     "(jangan taruh ||| di awal atau akhir). Sapaan pun dibalas 2 pesan: sapaan balik lalu satu kalimat lanjutan "
+                     "yang nyambung. Hanya pesan penutup seperti ok atau makasih yang cukup 1 pesan. "
+                     "Langsung ke inti dan jangan menjawab setengah-setengah atau menggantung, "
+                     "supaya lawan bicara tidak perlu bertanya ulang.")
     body = "\n".join(f"- {r}" for r in rules)
     return f"{persona}\n{STYLES[s['style']][1]}\n{MODE_TEXT[mode]}\n\nAturan wajib:\n{body}"
 
@@ -663,10 +693,12 @@ class UB:
         self.albums = set()
         self.joined = set()
         self.ai_at = {}
+        self.dm_locks = {}   # uid -> lock, supaya bubble satu percakapan tidak tercampur
         self.tasks = set()
         self.poller = None
         self.learning = False
         self.next_learn = 0.0   # kapan terakhir dicek perlu belajar lagi atau belum
+        self.next_resume = 0.0  # kapan terakhir dicek ada belajar yang harus dilanjutkan
         self.learn_stop = False  # tombol Hentikan di panel
         self.prog = ""          # ringkasan progres belajar untuk panel
 
@@ -826,6 +858,16 @@ class UB:
     async def poll_loop(self):
         await asyncio.sleep(3)
         while self.ready:
+            if not self.learning and time.time() >= self.next_resume:
+                # Belajar semua isi yang belum selesai (bot restart, error) dilanjutkan sendiri.
+                self.next_resume = time.time() + 60
+                try:
+                    for c in list(self.chans.values()):
+                        if await count(f"learnfull:{c['chat_id']}") == 1:
+                            self.spawn(self.learn_all(None, who=True, resume=True))
+                            break
+                except Exception as e:
+                    log.warning("lanjut belajar gagal: %s", e)
             if time.time() >= self.next_learn:
                 # Belajar otomatis dari channel: cek tiap jam, jalan kalau sudah lewat 12 jam.
                 self.next_learn = time.time() + 3600
@@ -1097,62 +1139,107 @@ class UB:
         await db.commit()
         return added
 
+    async def fetch_page(self, ent, limit, offset):
+        """Ambil satu halaman postingan (terbaru ke terlama). Kena FloodWait atau koneksi putus:
+        tunggu lalu coba lagi, jangan langsung menyerah."""
+        for attempt in range(8):
+            try:
+                return [m for m in await self.c.get_messages(ent, limit=limit, offset_id=offset) if m]
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(min(e.seconds + 1, 300))
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                await asyncio.sleep(min(5 * (attempt + 1), 60))
+        raise RuntimeError("gagal mengambil postingan (koneksi putus atau FloodWait berulang)")
+
+    async def learn_batch(self, ent, batch, s, user_ch):
+        """Pelajari beberapa postingan sekaligus (paralel). Satu postingan gagal tidak menghentikan yang lain."""
+        res = await asyncio.gather(*(self.learn_post(ent, p, s, user_ch) for p in batch), return_exceptions=True)
+        scanned = added = 0
+        for r in res:
+            if isinstance(r, BaseException) or r is None:
+                continue
+            scanned += 1
+            added += r
+        return scanned, added
+
     async def learn(self, ch, posts=40):
         """Baca postingan dan komentar aslinya. Yang disimpan hanya teks (tanpa nama atau ID).
-        posts=None berarti SEMUA isi channel, dari yang terbaru ke terlama. Posisinya disimpan,
-        jadi kalau terhenti (restart, dihentikan) bisa dilanjutkan. Return None kalau semuanya sudah selesai."""
+        posts=None berarti SEMUA isi channel, dari yang terbaru ke terlama. Posisinya disimpan tiap
+        kelompok postingan, jadi kalau terhenti (restart, error) bisa dilanjutkan dari posisi terakhir.
+        Return None kalau semuanya sudah selesai."""
         s = await settings()
         user_ch = ch["username"]
         ent = self.ents.get(ch["chat_id"]) or await self.c.get_entity(user_ch)
         pk = f"learnpos:{ch['chat_id']}"
+        fk = f"learnfull:{ch['chat_id']}"
+        full = posts is None
         offset = 0
-        if posts is None:
+        if full:
             pos = await count(pk)
             if pos == -1:
                 return None
             offset = max(pos, 0)
-        setpos = "INSERT INTO counters(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         scanned = added = seen_posts = since_bk = 0
         last_bk = time.time()
         completed = True
-        async for post in self.c.iter_messages(ent, limit=posts, offset_id=offset):
-            if self.learn_stop:
-                completed = False
+        while full or seen_posts < posts:
+            want = LEARN_PAGE if full else min(LEARN_PAGE, posts - seen_posts)
+            page = await self.fetch_page(ent, want, offset)
+            if not page:
                 break
-            got = await self.learn_post(ent, post, s, user_ch)
-            seen_posts += 1
-            if got is not None:
-                scanned += 1
-                added += got
-                since_bk += got
-            if posts is None:
-                await x(setpos, (pk, post.id))
-            self.prog = f"@{user_ch}: {seen_posts} post dibaca, {added} contoh baru"
-            if since_bk and time.time() - last_bk > BACKUP_EVERY:
-                await self.backup_safe()
-                since_bk, last_bk = 0, time.time()
-            if got is not None:
-                await asyncio.sleep(1)   # pelan-pelan supaya tidak kena FloodWait
-        if posts is None and completed:
-            await x(setpos, (pk, -1))
+            for i in range(0, len(page), LEARN_PARALLEL):
+                if self.learn_stop:
+                    completed = False
+                    break
+                batch = page[i:i + LEARN_PARALLEL]
+                sc, ad = await self.learn_batch(ent, batch, s, user_ch)
+                seen_posts += len(batch)
+                scanned += sc
+                added += ad
+                since_bk += ad
+                offset = batch[-1].id
+                if full:
+                    await x(SETCNT, (pk, offset))
+                self.prog = f"@{user_ch}: {seen_posts} post dibaca, {added} contoh baru"
+                if since_bk and time.time() - last_bk > BACKUP_EVERY:
+                    await self.backup_safe()
+                    since_bk, last_bk = 0, time.time()
+                if sc:
+                    await asyncio.sleep(LEARN_GAP)   # jeda singkat supaya tidak kena FloodWait
+            if not completed:
+                break
+        if full and completed:
+            await x(SETCNT, (pk, -1))
+            await x(SETCNT, (fk, 0))
         await x("DELETE FROM examples WHERE ch=? AND id NOT IN "
                 "(SELECT id FROM examples WHERE ch=? ORDER BY ts DESC LIMIT ?)", (user_ch, user_ch, MAX_EXAMPLES))
         return scanned, added
 
-    async def learn_all(self, posts=40, who=False, only=None):
+    async def learn_all(self, posts=40, who=False, only=None, resume=False):
         if self.learning:
             return
         self.learning = True
         self.learn_stop = False
         self.prog = ""
-        lines, total = [], 0
+        lines, total, had_err = [], 0, False
         try:
-            for ch in [c for c in self.chans.values() if only is None or c["username"] == only]:
+            targets = []
+            for c in self.chans.values():
+                if only is not None and c["username"] != only:
+                    continue
+                if resume and await count(f"learnfull:{c['chat_id']}") != 1:
+                    continue
+                targets.append(c)
+            if posts is None:
+                for c in targets:   # tandai supaya belajar lanjut sendiri kalau terhenti (restart, error)
+                    await x(SETCNT, (f"learnfull:{c['chat_id']}", 1))
+            for ch in targets:
                 if self.learn_stop:
                     break
                 try:
                     res = await self.learn(ch, posts)
                     if res is None:
+                        await x(SETCNT, (f"learnfull:{ch['chat_id']}", 0))
                         lines.append(f"@{ch['username']}: semua isi sudah pernah dipelajari "
                                      "(pakai Ulang dari awal kalau mau mengulang)")
                         continue
@@ -1161,13 +1248,17 @@ class UB:
                     tail = " (dihentikan, bisa dilanjutkan)" if self.learn_stop else ""
                     lines.append(f"@{ch['username']}: {sc} postingan dibaca, {ad} contoh baru{tail}")
                 except Exception as e:
-                    lines.append(f"@{ch['username']}: terhenti ({short(e)}), tekan lagi untuk melanjutkan")
+                    had_err = True
+                    more = "lanjut otomatis sebentar lagi" if posts is None else "tekan lagi untuk melanjutkan"
+                    lines.append(f"@{ch['username']}: terhenti ({short(e)}), {more}")
             if total:
                 await self.backup_safe()
-            if only is None:   # belajar satu channel tidak menunda jadwal belajar otomatis channel lain
+            if only is None and not resume:   # belajar satu channel tidak menunda jadwal belajar otomatis channel lain
                 await setv("learn_ts", int(time.time()))
+            if had_err:
+                self.next_resume = time.time() + 300   # kalau error, coba lanjut lagi 5 menit kemudian
             await log_("INFO", "Belajar channel selesai: " + "; ".join(lines))
-            if who and bot:
+            if who and bot and not (resume and had_err):
                 try:
                     await bot.send_message(OWNER_ID, "📚 <b>Selesai belajar</b>\n\n" + "\n".join(esc(l) for l in lines or ["Belum ada channel."]))
                 except Exception:
@@ -1182,7 +1273,7 @@ class UB:
         rows = await q("SELECT ch, kind, src, reply, ts FROM examples")
         if not rows:
             return 0
-        prog = await q("SELECT key, value FROM counters WHERE key LIKE 'learnpos:%'")
+        prog = await q("SELECT key, value FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%'")
         payload = {"v": 1, "examples": rows, "progress": prog}
         f = io.BytesIO(gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8")))
         f.name = "menfess_belajar.json.gz"
@@ -1321,6 +1412,12 @@ class UB:
         except Exception:
             return ev.sender_id
 
+    def dm_lock(self, uid):
+        lock = self.dm_locks.get(uid)
+        if lock is None:
+            lock = self.dm_locks[uid] = asyncio.Lock()
+        return lock
+
     async def say(self, chat, text, peer=None):
         self.ai_at[chat] = time.time()  # dicatat sebelum kirim supaya tidak dianggap takeover
         await self.c.send_message(peer or chat, text)
@@ -1352,24 +1449,31 @@ class UB:
         if s["dm_whitelist"] and u["lst"] != "white":
             return
         hk = f"dm:{uid}:{now_wib():%Y%m%d%H}"
-        if await count(hk) >= s["dm_hour"]:
+        if s["dm_hour"] > 0 and await count(hk) >= s["dm_hour"]:
             return await skip("batas DM per jam tercapai")
         if not u["greeted"]:
             await self.say(uid, DISCLOSURE, peer)
             await user_set(uid, greeted=1)
 
         key = f"dm:{uid}"
-        await hist_add(key, "user", text)
-        await humanize(s)
-        async with AI_SEM:
-            reply = await ask_ai("dm", await hist_get(key, 12), s)
-        if is_skip(reply):
-            return await skip("AI memilih SKIP")
-        await self.typing(peer, min(1 + len(reply) * 0.04, 5))
-        await self.say(uid, reply, peer)
-        await hist_add(key, "assistant", reply)
-        await incr(hk)
-        await stat("dm")
+        async with self.dm_lock(uid):   # satu percakapan diproses berurutan
+            await hist_add(key, "user", text)
+            await humanize(s)
+            async with AI_SEM:
+                reply = await ask_ai("dm", await hist_get(key, 12), s)
+            if is_skip(reply):
+                return await skip("AI memilih SKIP")
+            bubbles = split_bubbles(reply)
+            if not bubbles:
+                return await skip("balasan AI kosong")
+            for i, part in enumerate(bubbles):
+                if i:
+                    await asyncio.sleep(random.uniform(0.4, 1.2))   # jeda antar bubble seperti orang mengetik
+                await self.typing(peer, min(0.8 + len(part) * 0.03, 3))
+                await self.say(uid, part, peer)
+            await hist_add(key, "assistant", "\n".join(bubbles))
+            await incr(hk)
+            await stat("dm")
 
     async def takeover(self, ev):
         """Kalau kamu mengetik manual di DM yang ditangani AI, AI dimatikan untuk user itu."""
@@ -1668,7 +1772,8 @@ async def scr_learn(_=""):
         "<i>Yang disimpan hanya teks. Nama, ID, link, dan @mention dibuang. Bot juga belajar otomatis "
         "tiap 12 jam. Foto dibaca lewat Gemini.\n"
         "💾 Hasil belajar di-backup ke Pesan Tersimpan akun userbot dan dipulihkan sendiri kalau data hilang. "
-        "Belajar semua isi bisa dihentikan dan dilanjutkan kapan saja.</i>"
+        "Belajar semua isi lanjut otomatis kalau bot restart atau error, dan baru berhenti kalau sudah selesai "
+        "atau kamu tekan Hentikan.</i>"
     )
     rows = [
         [B(f"{on(s['learn_on'])} Pakai contoh asli", "tog", "learn_on"),
@@ -2092,17 +2197,18 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
             target = f"@{only}" if only else "semua channel"
             if n is None:
                 notice = (f"Mulai belajar SEMUA isi {target}, dari yang terbaru. Bot tetap membalas seperti biasa. "
-                          "Bisa dihentikan dan dilanjutkan kapan saja.")
+                          "Kalau terhenti (restart atau error) lanjut sendiri. Tekan Hentikan untuk berhenti.")
             else:
                 notice = f"Mulai belajar {n} post dari {target}. Hasilnya dikirim ke chat ini kalau selesai."
         text, rows = await render("chanv", only) if only else await render("learn")
         return await show_cb(cq, text, rows, notice)
     if a == "learnstop":
+        await x("UPDATE counters SET value=0 WHERE key LIKE 'learnfull:%'")   # matikan lanjut otomatis
         if ub and ub.learning:
             ub.learn_stop = True
-            notice = "Menghentikan... progres tersimpan dan bisa dilanjutkan."
+            notice = "Menghentikan... progres tersimpan. Belajar tidak lanjut otomatis sampai kamu mulai lagi."
         else:
-            notice = "Bot sedang tidak belajar."
+            notice = "Bot sedang tidak belajar. Lanjut otomatis dimatikan."
         text, rows = await render("learn")
         return await show_cb(cq, text, rows, notice)
     if a in ("dobackup", "dorestore"):
@@ -2197,7 +2303,7 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
             to = "sys"
         elif action == "cex":
             await x("DELETE FROM examples")
-            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%'")
+            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%'")
             if ub and ub.ready:
                 try:
                     await ub.drop_backups()
@@ -2205,7 +2311,7 @@ async def handle_cb(cq: CallbackQuery, cd: CB, state: FSMContext):
                     log.warning("hapus backup gagal: %s", e)
             to, notice = "learn", "Hasil belajar dan backup dihapus."
         elif action == "lreset":
-            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%'")
+            await x("DELETE FROM counters WHERE key LIKE 'learnpos:%' OR key LIKE 'learnfull:%'")
             to, notice = "learn", "Belajar semua isi channel akan mulai lagi dari postingan terbaru."
         elif action == "chist":
             await x("DELETE FROM hist")
