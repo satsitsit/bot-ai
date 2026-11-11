@@ -1,8 +1,6 @@
 """
 Menfess AI Bot: panel inline (aiogram) + userbot (Telethon) dalam satu proses.
-
-Jalankan bot:    python main.py
-Buat session:    python main.py session
+Session bisa dibuat langsung dari menu 🔑 Session di panel.
 """
 import asyncio
 import html
@@ -11,8 +9,11 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
+import zipfile
 from datetime import datetime
 from itertools import permutations
 
@@ -28,7 +29,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import TelegramClient, events, utils
-from telethon.sessions import StringSession
+from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
+from telethon.sessions import SQLiteSession, StringSession
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel, PeerChannel
 
@@ -72,6 +74,7 @@ STYLES = {
 NUMS = {
     "reply_prob": ("Probabilitas balas menfess (%)", 0, 100, 5, [25, 50, 75, 100]),
     "thread_prob": ("Probabilitas balas reply (%)", 0, 100, 5, [30, 60, 80, 100]),
+    "min_len": ("Panjang minimal menfess (karakter)", 1, 200, 1, [1, 3, 10, 20]),
     "delay_min": ("Jeda minimal (detik)", 0, 600, 5, [5, 15, 30]),
     "delay_max": ("Jeda maksimal (detik)", 0, 900, 5, [15, 30, 60, 120]),
     "max_comment_hour": ("Komentar per jam", 1, 60, 1, [3, 6, 10, 20]),
@@ -81,7 +84,7 @@ NUMS = {
 }
 DEFAULTS = {
     "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False, "notify": True,
-    "reply_prob": 60, "thread_prob": 70, "delay_min": 5, "delay_max": 25,
+    "reply_prob": 60, "thread_prob": 70, "min_len": 3, "delay_min": 5, "delay_max": 25,
     "max_comment_hour": 6, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
     "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": [],
     "model_gemini": MODELS["gemini"][0],
@@ -114,6 +117,7 @@ STARTED = time.time()
 bot = None
 ub = None
 db = None
+LOGIN = {}  # state login OTP yang sedang berjalan
 
 
 class AIError(Exception):
@@ -166,6 +170,11 @@ async def incr(key):
 
 async def stat(name):
     await incr(f"stat:{name}")
+
+
+async def skip(reason):
+    await stat("skipped")
+    await log_("INFO", f"Dilewati: {reason}")
 
 
 async def stats():
@@ -311,7 +320,7 @@ class UB:
     async def start(self):
         await self.c.connect()
         if not await self.c.is_user_authorized():
-            raise RuntimeError("TG_STRING_SESSION tidak valid")
+            raise RuntimeError("TG_STRING_SESSION kosong atau tidak valid")
         self.me = await self.c.get_me()
         self.c.add_event_handler(self.on_in, events.NewMessage(incoming=True))
         self.c.add_event_handler(self.on_out, events.NewMessage(outgoing=True))
@@ -342,7 +351,7 @@ class UB:
             "title": ent.title,
         }
 
-    # dispatch: setiap event diproses di task terpisah agar delay tidak memblokir update lain
+    # setiap event diproses di task terpisah agar delay tidak memblokir update lain
     def spawn(self, coro):
         t = asyncio.create_task(self.guard(coro))
         self.tasks.add(t)
@@ -382,40 +391,45 @@ class UB:
             await asyncio.sleep(min(1.5 + len(text) * 0.05, 8))
         await self.say(chat, text, reply_to)
 
-    # A. komentar menfess
+    # A. komentar menfess / B. balas reply
     async def group(self, ev):
         ch = self.by_disc[ev.chat_id]
         msg = ev.message
         s = await settings()
         fwd = msg.fwd_from
-        if fwd and fwd.channel_post and fwd.from_id and utils.get_peer_id(fwd.from_id) == ch["chat_id"]:
+        is_post = msg.sender_id == ch["chat_id"] or (
+            fwd and fwd.channel_post and fwd.from_id and utils.get_peer_id(fwd.from_id) == ch["chat_id"]
+        )
+        if is_post:
             return await self.menfess(msg, ch, s)
         if msg.reply_to_msg_id and msg.sender_id != self.me.id:
             return await self.reply(msg, s)
 
     async def menfess(self, msg, ch, s):
         if ch["paused"] or not s["comment_on"]:
-            return
+            return await skip("channel dijeda atau komentar nonaktif")
         text = (msg.message or "").strip()
-        if len(text) < 15 or random.uniform(0, 100) > s["reply_prob"]:
-            return await stat("skipped")
+        if len(text) < s["min_len"]:
+            return await skip(f"menfess terlalu pendek ({len(text)} karakter)")
+        if random.uniform(0, 100) > s["reply_prob"]:
+            return await skip("kena probabilitas")
         if s["keywords"] and not any(k.lower() in text.lower() for k in s["keywords"]):
-            return await stat("skipped")
+            return await skip("tidak ada keyword yang cocok")
         hk = f"hour:{datetime.now():%Y%m%d%H}:c"
         if await count(hk) >= s["max_comment_hour"]:
-            return await stat("skipped")
+            return await skip("batas komentar per jam tercapai")
 
+        await log_("INFO", f"Menfess #{msg.id} diproses")
         await humanize(s)
         prompt = f'Menfess:\n"""\n{text[:800]}\n"""\nTulis satu komentar singkat.'
         reply = await ask_ai("menfess", [{"role": "user", "content": prompt}], s)
         if is_skip(reply):
-            return await stat("skipped")
+            return await skip("AI memilih SKIP")
         await self.send(msg.chat_id, reply, msg.id)
         await incr(hk)
         await stat("comment")
-        await log_("INFO", f"Komentar menfess #{msg.id}")
+        await log_("INFO", f"Komentar terkirim ke menfess #{msg.id}")
 
-    # B. balas reply ke komentar userbot
     async def reply(self, msg, s):
         if not s["reply_on"]:
             return
@@ -424,25 +438,27 @@ class UB:
             return
         root = await find_root(target)
         if not root:
-            return
+            return await skip("reply bukan ke thread menfess")
         uid = msg.sender_id
         if (await user(uid))["lst"] == "black":
-            return
+            return await skip("pengirim di blacklist")
         text = (msg.message or "").strip()
         if len(text) < 2:
-            return
+            return await skip("reply terlalu pendek")
         thread = f"t:{msg.chat_id}:{root.id}"
         closed = f"closed:{thread}:{uid}"
         if await count(closed):
-            return
+            return await skip("percakapan sudah ditutup")
         if CLOSING.match(text):
             await incr(closed)
-            return
+            return await skip("pesan penutup")
         day = f"day:{uid}:{datetime.now():%Y%m%d}"
-        if await count(f"n:{thread}") >= s["max_thread"] or await count(day) >= s["max_user_day"]:
-            return
+        if await count(f"n:{thread}") >= s["max_thread"]:
+            return await skip("batas balasan per thread tercapai")
+        if await count(day) >= s["max_user_day"]:
+            return await skip("batas balasan per user tercapai")
         if random.uniform(0, 100) > s["thread_prob"]:
-            return await stat("skipped")
+            return await skip("reply kena probabilitas")
 
         sender = await msg.get_sender()
         name = getattr(sender, "first_name", None) or "Seseorang"
@@ -452,7 +468,7 @@ class UB:
         msgs = [{"role": "user", "content": f"Menfess asli:\n{post}"}] + await hist_get(thread, 10)
         reply = await ask_ai("reply", msgs, s)
         if is_skip(reply):
-            return await stat("skipped")
+            return await skip("AI memilih SKIP")
         await self.send(msg.chat_id, reply, msg.id)
         await hist_add(thread, "assistant", reply)
         await incr(f"n:{thread}")
@@ -482,7 +498,7 @@ class UB:
             return
         hk = f"dm:{uid}:{datetime.now():%Y%m%d%H}"
         if await count(hk) >= s["dm_hour"]:
-            return await stat("skipped")
+            return await skip("batas DM per jam tercapai")
         if not u["greeted"]:
             await self.say(uid, DISCLOSURE)
             await user_set(uid, greeted=1)
@@ -492,7 +508,7 @@ class UB:
         await humanize(s)
         reply = await ask_ai("dm", await hist_get(key, 12), s)
         if is_skip(reply):
-            return await stat("skipped")
+            return await skip("AI memilih SKIP")
         await self.send(uid, reply)
         await hist_add(key, "assistant", reply)
         await incr(hk)
@@ -510,7 +526,44 @@ class UB:
             await notify(f"🙋 Kamu mengambil alih chat {uid}. AI dimatikan untuk user ini.")
 
 
-# ---------- panel: callback & screen helpers ----------
+# ---------- session: konversi, verifikasi, login OTP ----------
+
+def session_to_string(path):
+    """Ubah file .session (SQLite Telethon) menjadi StringSession."""
+    old = SQLiteSession(path)
+    try:
+        if old.auth_key is None:
+            raise ValueError("file session kosong atau tidak valid")
+        new = StringSession()
+        new.set_dc(old.dc_id, old.server_address, old.port)
+        new.auth_key = old.auth_key
+        return new.save()
+    finally:
+        old.close()
+
+
+async def verify_string(string):
+    c = TelegramClient(StringSession(string), API_ID, API_HASH)
+    await c.connect()
+    try:
+        if not await c.is_user_authorized():
+            raise ValueError("session tidak aktif atau sudah logout")
+        return await c.get_me()
+    finally:
+        await c.disconnect()
+
+
+async def login_close():
+    c = LOGIN.get("client")
+    LOGIN.clear()
+    if c:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+
+
+# ---------- panel: helper ----------
 
 class CB(CallbackData, prefix="c"):
     a: str
@@ -571,7 +624,7 @@ async def scr_home(_=""):
     rows = [
         [B("📡 Channel", "chan"), B("🤖 Pengaturan AI", "ai")],
         [B("💬 Mode Chat", "chat"), B("📊 Statistik", "stats")],
-        [B("⚙️ Sistem", "sys")],
+        [B("⚙️ Sistem", "sys"), B("🔑 Session", "sess")],
     ]
     return text, rows
 
@@ -669,7 +722,8 @@ async def scr_chat(_=""):
         [B("⏱ Jeda Min", "num", "delay_min"), B("⏱ Jeda Max", "num", "delay_max")],
         [B("🔢 Komentar/Jam", "num", "max_comment_hour"), B("🔢 Balasan/Thread", "num", "max_thread")],
         [B("🔢 Balasan/User/Hari", "num", "max_user_day"), B("📩 DM/Jam", "num", "dm_hour")],
-        [B("🔑 Filter Keyword", "kw"), B("👥 Kelola DM", "dm")],
+        [B("📏 Min. Panjang", "num", "min_len"), B("🔑 Filter Keyword", "kw")],
+        [B("👥 Kelola DM", "dm")],
     ]
     return text, rows + back()
 
@@ -709,10 +763,7 @@ async def scr_duser(uid=""):
     u = await user(int(uid))
     ai_state = "🟢 aktif" if u["ai_on"] else "⛔ nonaktif"
     stop_state = "dihentikan (/stop)" if u["stopped"] else "berjalan"
-    text = (
-        f"<b>👤 Pengguna {uid}</b>\n\n"
-        f"Status : {user_tag(u)}\nAI : {ai_state}\nBalasan : {stop_state}"
-    )
+    text = f"<b>👤 Pengguna {uid}</b>\n\nStatus : {user_tag(u)}\nAI : {ai_state}\nBalasan : {stop_state}"
     rows = [
         [B("🔁 Aktifkan AI" if not u["ai_on"] else "⛔ Matikan AI", "aitog", uid)],
         [B("✅ Whitelist", "list", f"{uid}:white"), B("🚫 Blacklist", "list", f"{uid}:black")],
@@ -747,10 +798,10 @@ async def scr_sys(_=""):
     up = int(time.time() - STARTED)
     hours, minutes = divmod(up // 60, 60)
     size = os.path.getsize(DB_PATH) / 1024 if os.path.exists(DB_PATH) else 0
-    userbot_line = f"🟢 Online ({html.escape(ub.me.first_name or '')})" if ub and ub.ready else "🔴 Offline"
+    ub_line = f"🟢 Online ({html.escape(ub.me.first_name or '')})" if ub and ub.ready else "🔴 Offline"
     text = (
         "<b>⚙️ Sistem</b>\n\n"
-        f"🤖 Userbot : {userbot_line}\n"
+        f"🤖 Userbot : {ub_line}\n"
         f"🗄 Database : {size:.1f} KB\n"
         f"⏱ Uptime : {hours} jam {minutes} menit\n"
         f"🔔 Notifikasi : {'aktif' if s['notify'] else 'nonaktif'}"
@@ -759,6 +810,22 @@ async def scr_sys(_=""):
         [B(f"{on(s['notify'])} Notifikasi", "tog", "notify"), B("🧹 Hapus Log", "ask", "clogs")],
         [B("🗑 Hapus Riwayat AI", "ask", "chist"), B("🔄 Refresh", "sys")],
         [B("🔁 Restart", "ask", "restart")],
+    ]
+    return text, rows + back()
+
+
+async def scr_sess(_=""):
+    online = bool(ub and ub.ready)
+    text = (
+        "<b>🔑 Session Userbot</b>\n\n"
+        f"Status : {'🟢 Userbot login' if online else '🔴 Userbot belum login'}\n\n"
+        "Buat session baru, lalu salin string-nya ke secret <code>TG_STRING_SESSION</code>.\n"
+        "• <b>Upload</b>: pakai file <code>.session</code> dari PC.\n"
+        "• <b>Login OTP</b>: masuk langsung lewat kode dari Telegram."
+    )
+    rows = [
+        [B("📤 Upload .session / .zip", "in", "sessfile")],
+        [B("🔐 Login pakai OTP", "in", "phone")],
     ]
     return text, rows + back()
 
@@ -780,26 +847,40 @@ async def scr_ask(spec=""):
 
 
 INPUT_TEXT = {
-    "channel": ("➕ Tambah Channel", "Kirim username channel, contoh <code>@namachannel</code>.\n"
+    "channel": ("➕ Tambah Channel",
+                "Kirim username channel, contoh <code>@namachannel</code>.\n"
                 "Userbot harus sudah menjadi member discussion group-nya."),
     "prompt": ("📝 Prompt Kustom", "Kirim instruksi kepribadian AI. Ini menggantikan persona bawaan."),
     "keyword": ("🔑 Filter Keyword", "Kirim kata dipisahkan koma. Kirim <code>-</code> untuk mengosongkan."),
     "white": ("✅ Whitelist DM", "Kirim user ID Telegram (angka)."),
     "black": ("🚫 Blacklist DM", "Kirim user ID Telegram (angka)."),
+    "sessfile": ("📤 Upload Session",
+                 "Kirim file <code>.session</code> atau <code>.zip</code> yang berisi .session. "
+                 "Hanya gunakan file milik akunmu sendiri."),
+    "phone": ("📱 Login OTP", "Kirim nomor HP akun userbot dengan kode negara, contoh <code>+628123456789</code>."),
+    "code": ("🔢 Kode OTP", "Kirim kode yang dikirim Telegram ke akun tersebut."),
+    "pwd": ("🔒 Password 2FA", "Kirim password verifikasi dua langkah akun tersebut."),
 }
-INPUT_BACK = {"channel": "chan", "prompt": "ai", "keyword": "kw", "white": "dm", "black": "dm"}
+INPUT_BACK = {
+    "channel": "chan", "prompt": "ai", "keyword": "kw", "white": "dm", "black": "dm",
+    "sessfile": "sess", "phone": "sess", "code": "sess", "pwd": "sess",
+}
+LOGIN_KINDS = {"phone", "code", "pwd"}
 
 
 def input_screen(kind):
     title, desc = INPUT_TEXT[kind]
-    return f"<b>{title}</b>\n\n{desc}", back(INPUT_BACK[kind])
+    rows = back(INPUT_BACK[kind])
+    if kind in LOGIN_KINDS:
+        rows = [[B("🛑 Batalkan login", "loginx")]] + rows
+    return f"<b>{title}</b>\n\n{desc}", rows
 
 
 SCREENS = {
     "home": scr_home, "chan": scr_chan, "chanv": scr_chanv, "ai": scr_ai,
     "aiord": scr_aiord, "aimdl": scr_aimdl, "aipers": scr_aipers, "aisty": scr_aisty,
     "chat": scr_chat, "num": scr_num, "kw": scr_kw, "dm": scr_dm, "duser": scr_duser,
-    "stats": scr_stats, "sys": scr_sys,
+    "stats": scr_stats, "sys": scr_sys, "sess": scr_sess,
 }
 
 
@@ -807,7 +888,7 @@ async def render(to, arg=""):
     return await SCREENS.get(to, scr_home)(arg)
 
 
-# ---------- panel: aiogram handlers ----------
+# ---------- panel: aiogram ----------
 
 class In(StatesGroup):
     channel = State()
@@ -815,9 +896,16 @@ class In(StatesGroup):
     keyword = State()
     white = State()
     black = State()
+    sessfile = State()
+    phone = State()
+    code = State()
+    pwd = State()
 
 
-INPUTS = {"channel": In.channel, "prompt": In.prompt, "keyword": In.keyword, "white": In.white, "black": In.black}
+INPUTS = {
+    "channel": In.channel, "prompt": In.prompt, "keyword": In.keyword,
+    "white": In.white, "black": In.black, "sessfile": In.sessfile, "phone": In.phone,
+}
 PANEL = {"chat": None, "mid": None}
 
 panel = Router(name="panel")
@@ -826,7 +914,7 @@ panel.callback_query.filter(F.from_user.id == OWNER_ID)
 
 
 async def show(text, rows, notice=None):
-    """Edit satu pesan panel. Jika belum ada atau sudah hilang, kirim yang baru."""
+    """Edit satu pesan panel. Jika belum ada atau sudah hilang, kirim yang baru di bawah."""
     if notice:
         text = f"<i>{html.escape(notice)}</i>\n\n{text}"
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -850,11 +938,38 @@ async def show_cb(cq: CallbackQuery, text, rows, notice=None):
     await show(text, rows, notice)
 
 
+async def show_result(notice):
+    text, rows = await render("sess")
+    await show(text, rows, notice)
+
+
+async def show_string(string, me, source):
+    text = (
+        "<b>🔑 Session siap</b>\n\n"
+        f"Akun : {html.escape(me.first_name or '-')} (dari {source})\n\n"
+        "1. Salin string di bawah.\n"
+        "2. Simpan sebagai secret <code>TG_STRING_SESSION</code> di GitHub.\n"
+        "3. Jalankan ulang workflow.\n"
+        "4. Tekan Beranda agar string ini hilang dari layar.\n\n"
+        f"<code>{string}</code>"
+    )
+    await show(text, back("sess"))
+
+
 async def delete_msg(msg: Message):
     try:
         await msg.delete()
     except Exception:
         pass
+
+
+async def drop_panel():
+    if PANEL["mid"]:
+        try:
+            await bot.delete_message(PANEL["chat"], PANEL["mid"])
+        except Exception:
+            pass
+    PANEL["chat"] = PANEL["mid"] = None
 
 
 def restart():
@@ -863,8 +978,9 @@ def restart():
 
 @panel.message(CommandStart())
 async def on_start(msg: Message, state: FSMContext):
+    # /start TIDAK dihapus. Panel lama dihapus, panel baru dikirim di bawah /start.
     await state.clear()
-    await delete_msg(msg)
+    await drop_panel()
     text, rows = await render("home")
     await show(text, rows)
 
@@ -883,6 +999,10 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
     if a == "ask":
         text, rows = await scr_ask(b)
         return await show_cb(cq, text, rows)
+    if a == "loginx":
+        await login_close()
+        text, rows = await render("sess")
+        return await show_cb(cq, text, rows, "Login dibatalkan.")
     if a == "tog":
         s = await settings()
         await setv(b, not s[b])
@@ -909,8 +1029,7 @@ async def on_cb(cq: CallbackQuery, callback_data: CB, state: FSMContext):
         to, arg = "num", key
     elif a == "prov":
         s = await settings()
-        disabled = set(s["disabled"]) ^ {b}
-        await setv("disabled", sorted(disabled))
+        await setv("disabled", sorted(set(s["disabled"]) ^ {b}))
         to, arg = "aiord", ""
     elif a == "pause":
         await x("UPDATE channels SET paused = 1 - paused WHERE username=?", (b,))
@@ -960,7 +1079,7 @@ async def in_channel(msg: Message, state: FSMContext):
     await delete_msg(msg)
     name = (msg.text or "").strip().lstrip("@").lower()
     if not ub or not ub.ready:
-        notice = "Userbot belum online."
+        notice = "Userbot belum online. Buat session dulu di menu 🔑 Session."
     elif not name:
         notice = "Username tidak valid."
     else:
@@ -983,11 +1102,10 @@ async def in_prompt(msg: Message, state: FSMContext):
     await state.clear()
     await delete_msg(msg)
     raw = (msg.text or "").strip()
-    notice = "Prompt kustom disimpan." if raw else "Kirim teks untuk prompt."
     if raw:
         await setv("prompt", raw[:1500])
     text, rows = await render("ai")
-    await show(text, rows, notice)
+    await show(text, rows, "Prompt kustom disimpan." if raw else "Kirim teks untuk prompt.")
 
 
 @panel.message(In.keyword)
@@ -1024,6 +1142,115 @@ async def in_black(msg: Message, state: FSMContext):
     await list_input(msg, state, "black")
 
 
+@panel.message(In.sessfile)
+async def in_sessfile(msg: Message, state: FSMContext):
+    await state.clear()
+    await delete_msg(msg)
+    doc = msg.document
+    name = (doc.file_name or "").lower() if doc else ""
+    if not name.endswith((".session", ".zip")):
+        return await show_result("Kirim file berekstensi .session atau .zip.")
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        return await show_result("File terlalu besar (maks 5 MB).")
+
+    tmp = tempfile.mkdtemp()
+    try:
+        raw = os.path.join(tmp, "upload")
+        await bot.download(doc, destination=raw)
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(raw) as zf:
+                member = next((n for n in zf.namelist() if n.lower().endswith(".session")), None)
+                if not member:
+                    raise ValueError("zip tidak berisi file .session")
+                data = zf.read(member)
+        else:
+            with open(raw, "rb") as f:
+                data = f.read()
+        path = os.path.join(tmp, "account.session")
+        with open(path, "wb") as f:
+            f.write(data)
+        string = session_to_string(path)
+        me = await verify_string(string)
+    except Exception as e:
+        return await show_result(f"Gagal memproses session: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    await show_string(string, me, "upload")
+
+
+@panel.message(In.phone)
+async def in_phone(msg: Message, state: FSMContext):
+    await delete_msg(msg)
+    phone = re.sub(r"[\s-]", "", msg.text or "")
+    if not re.fullmatch(r"\+\d{8,15}", phone):
+        text, rows = input_screen("phone")
+        return await show(text, rows, "Format salah. Contoh: +628123456789")
+    await login_close()
+    try:
+        c = TelegramClient(StringSession(), API_ID, API_HASH)
+        await c.connect()
+        sent = await c.send_code_request(phone)
+    except Exception as e:
+        await state.clear()
+        return await show_result(f"Gagal kirim kode: {e}")
+    LOGIN.update(client=c, phone=phone, hash=sent.phone_code_hash)
+    await state.set_state(In.code)
+    text, rows = input_screen("code")
+    await show(text, rows, "Kode OTP dikirim ke akun Telegram tersebut.")
+
+
+@panel.message(In.code)
+async def in_code(msg: Message, state: FSMContext):
+    await delete_msg(msg)
+    code = re.sub(r"\D", "", msg.text or "")
+    c = LOGIN.get("client")
+    if not c or not code:
+        await state.clear()
+        await login_close()
+        return await show_result("Sesi login tidak ditemukan. Mulai lagi dari menu Session.")
+    try:
+        await c.sign_in(phone=LOGIN["phone"], code=code, phone_code_hash=LOGIN["hash"])
+    except SessionPasswordNeededError:
+        await state.set_state(In.pwd)
+        text, rows = input_screen("pwd")
+        return await show(text, rows, "Akun ini memakai 2FA. Kirim password-nya.")
+    except PhoneCodeInvalidError:
+        text, rows = input_screen("code")
+        return await show(text, rows, "Kode salah. Coba lagi.")
+    except Exception as e:
+        await state.clear()
+        await login_close()
+        return await show_result(f"Login gagal: {e}")
+    await state.clear()
+    string = c.session.save()
+    me = await c.get_me()
+    await c.disconnect()
+    LOGIN.clear()
+    await show_string(string, me, "login OTP")
+
+
+@panel.message(In.pwd)
+async def in_pwd(msg: Message, state: FSMContext):
+    await delete_msg(msg)
+    pwd = (msg.text or "").strip()
+    c = LOGIN.get("client")
+    if not c or not pwd:
+        await state.clear()
+        await login_close()
+        return await show_result("Sesi login tidak ditemukan. Mulai lagi dari menu Session.")
+    try:
+        await c.sign_in(password=pwd)
+    except Exception:
+        text, rows = input_screen("pwd")
+        return await show(text, rows, "Password salah. Coba lagi.")
+    await state.clear()
+    string = c.session.save()
+    me = await c.get_me()
+    await c.disconnect()
+    LOGIN.clear()
+    await show_string(string, me, "login OTP")
+
+
 @panel.message()
 async def on_any(msg: Message, state: FSMContext):
     await state.clear()
@@ -1047,7 +1274,7 @@ async def run_bot():
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(panel)
-    await notify("✅ Bot aktif." if ub.ready else "⚠️ Panel aktif, userbot offline.")
+    await notify("✅ Bot aktif." if ub.ready else "⚠️ Panel aktif. Userbot offline, buat session di menu 🔑 Session.")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
@@ -1059,18 +1286,7 @@ async def run_bot():
         await db.close()
 
 
-async def make_session():
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.start()
-    print("\nSalin nilai ini ke GitHub Secret TG_STRING_SESSION:\n")
-    print(client.session.save())
-    await client.disconnect()
-
-
 if __name__ == "__main__":
-    if sys.argv[1:] == ["session"]:
-        asyncio.run(make_session())
-    else:
-        if not BOT_TOKEN or not OWNER_ID:
-            raise SystemExit("BOT_TOKEN dan OWNER_ID wajib diisi")
-        asyncio.run(run_bot())
+    if not BOT_TOKEN or not OWNER_ID:
+        raise SystemExit("BOT_TOKEN dan OWNER_ID wajib diisi")
+    asyncio.run(run_bot())
