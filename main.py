@@ -60,9 +60,10 @@ URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
 }
 # Nama model bisa berubah. Kalau Tes AI menampilkan 404, ganti di sini atau pilih model lain di panel.
+# Update 11/11/2026: llama-3.x (Groq) pensiun 16 Agu 2026, gemini-2.5-* pensiun 16 Okt 2026.
 MODELS = {
-    "gemini": ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-    "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    "gemini": ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest"],
+    "groq": ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.6-27b"],
     "openrouter": ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-3-27b-it:free"],
 }
 PERSONAS = {
@@ -112,14 +113,14 @@ DEFAULTS = {
     "comment_on": True, "reply_on": True, "dm_on": True, "dm_whitelist": False,
     "notify": True, "notify_ok": False,
     "reply_prob": 100, "thread_prob": 70, "min_len": 0, "delay_min": 0, "delay_max": 3,
-    "max_comment_hour": 0, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
-    "keywords": [], "order": ["gemini", "groq", "openrouter"], "disabled": [],
+    "max_comment_hour": 40, "max_age_min": 60, "max_thread": 3, "max_user_day": 10, "dm_hour": 20,
+    "keywords": [], "order": ["gemini", "groq"], "disabled": [],
     "model_gemini": MODELS["gemini"][0],
     "model_groq": MODELS["groq"][0],
     "model_openrouter": MODELS["openrouter"][0],
     "persona": "teman", "style": "x", "prompt": "",
 }
-SETTINGS_VERSION = 6   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
+SETTINGS_VERSION = 9   # naikkan kalau DEFAULTS diubah, supaya pengaturan lama tidak menimpa
 POLL_SEC = 10          # jeda cek berkala channel (cadangan kalau update realtime tidak masuk)
 SEND_GAP = 2.5         # jeda minimal antar komentar, mencegah FloodWait
 DISCLOSURE = (
@@ -355,7 +356,7 @@ def is_skip(text):
 def system_prompt(s, mode):
     persona = s["prompt"].strip() or PERSONAS[s["persona"]][1]
     rules = [
-        "Balas dalam Bahasa Indonesia, singkat (1-2 kalimat), seperti chat sungguhan.",
+        "Balas dalam Bahasa Indonesia, sangat singkat (1 kalimat, maksimal 20 kata), seperti chat sungguhan.",
         "Jika ditanya langsung, jujur bahwa kamu asisten AI. Jangan mengaku manusia.",
         "Jangan menghina, memprovokasi, membahas SARA, konten seksual, atau kekerasan.",
         "Jangan meminta atau membagikan data pribadi.",
@@ -414,11 +415,16 @@ async def call(http, name, model, system, msgs):
         parts = (cands[0].get("content") or {}).get("parts") or []
         return "".join(p.get("text", "") for p in parts)
 
+    body = {"model": model, "messages": [{"role": "system", "content": system}, *msgs],
+            "temperature": 0.9, "max_tokens": 200}
+    if name == "groq" and model.startswith(("openai/gpt-oss", "qwen/")):
+        # model reasoning: token "berpikir" ikut dihitung, jadi budget dilonggarkan dan effort dibuat rendah
+        body["max_tokens"] = 1500
+        body["reasoning_effort"] = "low" if model.startswith("openai/") else "none"
     r = await http.post(
         URLS[name],
         headers={"Authorization": f"Bearer {KEYS[name]}"},
-        json={"model": model, "messages": [{"role": "system", "content": system}, *msgs],
-              "temperature": 0.9, "max_tokens": 300},
+        json=body,
     )
     if r.status_code >= 400:
         raise RuntimeError(http_err(r.status_code))
@@ -430,7 +436,7 @@ async def ask_ai(mode, msgs, s):
     system = system_prompt(s, mode)
     msgs = merge_roles(msgs)
     errs = []
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx.AsyncClient(timeout=20) as http:
         for name in s["order"]:
             if name in s["disabled"]:
                 errs.append(f"{NAMES[name]}: dimatikan di panel")
@@ -438,34 +444,62 @@ async def ask_ai(mode, msgs, s):
             if not KEYS.get(name):
                 errs.append(f"{NAMES[name]}: API key belum diisi")
                 continue
-            try:
-                text = (await call(http, name, s[f"model_{name}"], system, msgs) or "").strip()
-                text = text.strip("\"'").strip()
-                if text:
-                    if s["style"] == "x":
-                        text = text.lower()
-                    return text[:600]
-                errs.append(f"{NAMES[name]}: respons kosong")
-            except Exception as e:
-                errs.append(f"{NAMES[name]}: {short(e)}")
+            chosen = s[f"model_{name}"]
+            for model in [chosen] + [m for m in MODELS[name] if m != chosen]:
+                try:
+                    text = (await call(http, name, model, system, msgs) or "").strip()
+                    text = text.strip("\"'").strip()
+                    if text:
+                        if s["style"] == "x":
+                            text = text.lower()
+                        return text[:600]
+                    errs.append(f"{NAMES[name]}: respons kosong")
+                    break
+                except Exception as e:
+                    errs.append(f"{NAMES[name]}: {short(e)}")
+                    if isinstance(e, httpx.TimeoutException) or any(
+                        c in str(e) for c in ("HTTP 404", "HTTP 400", "HTTP 429", "HTTP 5")
+                    ):
+                        continue   # kuota/overload/pensiun: tiap model punya kuota sendiri, coba model lain
+                    break          # 401/403 = masalah API key, model lain juga pasti gagal
     raise AIError(" | ".join(errs) or "tidak ada provider aktif")
 
 
 async def test_providers(s):
+    """Tes SEMUA model tiap provider. Kalau model yang sedang dipakai gagal tapi ada yang lolos,
+    model pertama yang lolos langsung dipakai (disimpan ke pengaturan)."""
     lines = []
     async with httpx.AsyncClient(timeout=25) as http:
-        for name in s["order"]:
-            label = f"{NAMES[name]} · {s['model_' + name]}"
-            if not KEYS.get(name):
-                lines.append(f"⚪ {label}: API key belum diisi")
-                continue
+        async def probe(name, model):
             t0 = time.time()
             try:
-                await call(http, name, s[f"model_{name}"], "Balas singkat.",
+                await call(http, name, model, "Balas singkat.",
                            [{"role": "user", "content": "Balas satu kata: halo"}])
-                lines.append(f"✅ {label}: bisa dipakai ({time.time() - t0:.1f} dtk)")
+                return True, f"{time.time() - t0:.1f} dtk"
             except Exception as e:
-                lines.append(f"❌ {label}: {short(e)}")
+                return False, short(e)
+
+        for name in s["order"]:
+            if not KEYS.get(name):
+                lines.append(f"⚪ {NAMES[name]}: API key belum diisi")
+                continue
+            models = MODELS[name]
+            results = await asyncio.gather(*(probe(name, m) for m in models))   # semua model dites bersamaan
+            current = s[f"model_{name}"]
+            ok = [m for m, (good, _) in zip(models, results) if good]
+            if current in ok:
+                pick = current
+            else:
+                pick = ok[0] if ok else None
+            for m, (good, info) in zip(models, results):
+                mark = "  ← dipakai" if m == pick else ""
+                lines.append(f"{'✅' if good else '❌'} {NAMES[name]} · {m}: "
+                             f"{'bisa dipakai (' + info + ')' if good else info}{mark}")
+            if pick and pick != current:
+                await setv(f"model_{name}", pick)
+                lines.append(f"🔁 {NAMES[name]}: model otomatis diganti ke {pick}")
+            elif not pick:
+                lines.append(f"⚠️ {NAMES[name]}: tidak ada model yang lolos, model lama tetap dipakai")
     return lines
 
 
@@ -1168,7 +1202,7 @@ async def scr_aitest(_=""):
     s = await settings()
     lines = await test_providers(s)
     text = "<b>🧪 Tes AI</b>\n🕒 " + fmt() + "\n\n" + "\n".join(esc(line) for line in lines)
-    text += "\n\n<i>✅ berarti provider itu bisa dipakai. ❌ menjelaskan penyebabnya.</i>"
+    text += "\n\n<i>✅ model bisa dipakai, ❌ menjelaskan penyebabnya. Model yang lolos otomatis dipakai.</i>"
     return text, [[B("🔄 Tes ulang", "aitest")]] + back("ai")
 
 
